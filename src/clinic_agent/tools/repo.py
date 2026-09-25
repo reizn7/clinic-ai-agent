@@ -117,9 +117,13 @@ def get_available_slots(doctor_name: str, date_key: str) -> dict:
 
 
 def _upsert_patient(phone: str, name: str, age: int, gender: str) -> ObjectId:
+    now = datetime.now(UTC)
     res = get_db()["patients"].find_one_and_update(
         {"phone": phone},
-        {"$set": {"name": name, "age": age, "gender": gender}, "$setOnInsert": {"phone": phone}},
+        {
+            "$set": {"name": name, "age": age, "gender": gender, "updatedAt": now},
+            "$setOnInsert": {"phone": phone, "createdAt": now},
+        },
         upsert=True,
         return_document=True,
     )
@@ -143,6 +147,7 @@ def create_appointment(
                 "slot": slot,
                 "status": "Pending",
                 "createdAt": datetime.now(UTC),
+                "updatedAt": datetime.now(UTC),
             }
         )
     except DuplicateKeyError:
@@ -189,8 +194,10 @@ def cancel_appointment(appointment_id: str) -> dict:
         oid = ObjectId(appointment_id)
     except (InvalidId, TypeError):
         return {"success": False, "error": "Invalid appointment id."}
+    now = datetime.now(UTC)
     res = get_db()["appointments"].update_one(
-        {"_id": oid}, {"$set": {"status": "Cancelled"}}
+        {"_id": oid},
+        {"$set": {"status": "Cancelled", "cancelledAt": now, "updatedAt": now}},
     )
     if res.matched_count == 0:
         return {"success": False, "error": "Appointment not found."}

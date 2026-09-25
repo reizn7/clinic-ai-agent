@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     )
     MONGO_DB_NAME: str = "clinic-ai-agent"
 
+    # Stamped on every conversations doc so a second clinic is a later change,
+    # not a migration (see the console data contract).
+    CLINIC_ID: str = "main-clinic"
+
     # --- App ---
     LOG_LEVEL: str = "INFO"
     PORT: int = 3000

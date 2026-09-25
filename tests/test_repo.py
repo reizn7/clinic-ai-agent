@@ -1,5 +1,6 @@
 import mongomock
 import pytest
+from bson import ObjectId
 
 from clinic_agent.tools import repo
 
@@ -81,3 +82,23 @@ def test_cancel_appointment_frees_slot(db):
 
 def test_cancel_invalid_id(db):
     assert repo.cancel_appointment("not-an-id")["success"] is False
+
+
+def test_booking_writes_patient_and_appointment_timestamps(db):
+    booked = repo.create_appointment(
+        "919999999999", "Ravi", 30, "Male", "Asha Mehta", MON, "09:30"
+    )
+    patient = db["patients"].find_one({"phone": "919999999999"})
+    assert "createdAt" in patient and "updatedAt" in patient
+
+    appt = db["appointments"].find_one({"_id": ObjectId(booked["appointmentId"])})
+    assert "createdAt" in appt and "updatedAt" in appt
+
+
+def test_cancel_stamps_cancelled_at(db):
+    booked = repo.create_appointment(
+        "919999999999", "Ravi", 30, "Male", "Asha Mehta", MON, "09:30"
+    )
+    repo.cancel_appointment(booked["appointmentId"])
+    appt = db["appointments"].find_one({"_id": ObjectId(booked["appointmentId"])})
+    assert "cancelledAt" in appt

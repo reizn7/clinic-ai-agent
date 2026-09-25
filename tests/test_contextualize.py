@@ -1,9 +1,10 @@
 from clinic_agent.runtime.turn import contextualize
 
 
-def test_no_history_includes_identity():
+def test_no_history_includes_identity_and_date():
     out = contextualize("Hi", [], "919999999999")
     assert "919999999999" in out
+    assert "Today's date is" in out
     assert out.strip().endswith("Hi")
 
 
@@ -19,7 +20,8 @@ def test_history_is_labelled_and_included():
     assert "911234567890" in out
 
 
-def test_no_phone_no_identity_header():
+def test_no_phone_omits_phone_line_but_keeps_date():
     out = contextualize("Hello", [], "")
-    assert "Caller" not in out
-    assert out == "Hello"
+    assert "WhatsApp number" not in out
+    assert "Today's date is" in out
+    assert out.strip().endswith("Hello")

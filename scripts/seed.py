@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from clinic_agent.db import get_db  # noqa: E402
+from clinic_agent.runtime import conversations  # noqa: E402
 from clinic_agent.tools.repo import ensure_indexes  # noqa: E402
 
 CLINIC = {
@@ -53,6 +54,7 @@ def main() -> None:
             upsert=True,
         )
     ensure_indexes()
+    conversations.ensure_indexes()
     print(
         f"Seed complete: 1 clinic, {len(DOCTORS)} doctors, indexes ensured "
         f"(db='{db.name}')."
