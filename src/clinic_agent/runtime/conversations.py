@@ -25,10 +25,15 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from pymongo import ReturnDocument
 
 from clinic_agent.config import settings
 from clinic_agent.db import get_db
+
+if TYPE_CHECKING:
+    from clinic_agent.runtime.analytics import ConversationAnalytics
 
 COLLECTION = "conversations"
 IDLE_TIMEOUT = timedelta(minutes=30)
@@ -190,6 +195,87 @@ def _build_turn_messages(
 def _patient_name(phone: str) -> str:
     doc = get_db()["patients"].find_one({"phone": phone}, {"name": 1})
     return (doc or {}).get("name") or "Unknown"
+
+
+def _render_transcript(messages: list[dict]) -> str:
+    """Plain 'role: content' transcript of the text turns (skips tool calls)."""
+    lines = [
+        f"{m.get('role')}: {m.get('content', '')}"
+        for m in messages
+        if m.get("type", "text") == "text"
+    ]
+    return "\n".join(lines)
+
+
+# ---- finalize + analytics (called by the idle sweeper) --------------------
+
+
+def close_idle_active(idle_cutoff_iso: str) -> int:
+    """Close active conversations whose last activity predates the cutoff.
+
+    ``endedAt`` is refreshed to now on every turn, so it is the last-activity
+    marker; ISO-8601 UTC strings compare chronologically as plain strings.
+    """
+    col = get_db()[COLLECTION]
+    closed = 0
+    for conv in col.find({"status": "active", "endedAt": {"$lt": idle_cutoff_iso}}):
+        status = _final_status(_calls_from_messages(conv.get("messages", [])))
+        col.update_one({"externalId": conv["externalId"]}, {"$set": {"status": status}})
+        closed += 1
+    return closed
+
+
+def claim_analytics_batch(stuck_cutoff_iso: str, limit: int) -> list[tuple[str, str]]:
+    """Claim ended conversations needing analytics; return (externalId, transcript).
+
+    Picks conversations that are no longer active and have no analytics yet, plus
+    any stuck in ``processing`` past the cutoff. Claiming flips them to
+    ``processing`` atomically so a second pass won't double-process them.
+    """
+    col = get_db()[COLLECTION]
+    now = datetime.now(UTC).isoformat()
+    query = {
+        "status": {"$ne": "active"},
+        "$or": [
+            {"analyticsStatus": {"$exists": False}},
+            {"analyticsStatus": "processing", "analyticsStartedAt": {"$lt": stuck_cutoff_iso}},
+        ],
+    }
+    claimed: list[tuple[str, str]] = []
+    for conv in col.find(query).limit(limit):
+        doc = col.find_one_and_update(
+            {
+                "externalId": conv["externalId"],
+                "$or": [
+                    {"analyticsStatus": {"$exists": False}},
+                    {"analyticsStatus": "processing"},
+                ],
+            },
+            {"$set": {"analyticsStatus": "processing", "analyticsStartedAt": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if doc:
+            claimed.append((doc["externalId"], _render_transcript(doc.get("messages", []))))
+    return claimed
+
+
+def apply_analytics(external_id: str, result: ConversationAnalytics | None) -> None:
+    """Store analytics (or mark failed) for a claimed conversation."""
+    col = get_db()[COLLECTION]
+    if result is None:
+        col.update_one({"externalId": external_id}, {"$set": {"analyticsStatus": "failed"}})
+        return
+    col.update_one(
+        {"externalId": external_id},
+        {
+            "$set": {
+                "summary": result.summary,
+                "sentiment": result.sentiment,
+                "language": result.language,
+                "analyticsStatus": "complete",
+            }
+        },
+    )
 
 
 # ---- the writer -----------------------------------------------------------

@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     # not a migration (see the console data contract).
     CLINIC_ID: str = "main-clinic"
 
+    # --- Conversation finalize + analytics (idle sweeper) ---
+    ANALYTICS_ENABLED: bool = True
+    IDLE_TIMEOUT_MINUTES: int = 30  # silence after which a conversation is closed
+    SWEEP_SECONDS: int = 60  # how often the background sweeper runs
+    ANALYTICS_STUCK_MINUTES: int = 10  # reclaim analytics stuck in "processing"
+
     # --- App ---
     LOG_LEVEL: str = "INFO"
     PORT: int = 3000

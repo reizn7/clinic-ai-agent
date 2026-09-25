@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+from collections.abc import AsyncIterator
 
 from dotenv import load_dotenv
 
@@ -11,12 +14,25 @@ load_dotenv()
 from fastapi import FastAPI  # noqa: E402
 
 from clinic_agent.config import settings  # noqa: E402
+from clinic_agent.runtime import sweeper  # noqa: E402
 from clinic_agent.whatsapp.webhook import router as webhook_router  # noqa: E402
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Background idle sweeper: finalize conversations + generate analytics.
+    task = asyncio.create_task(sweeper.run_forever())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def create_app() -> FastAPI:
     logging.basicConfig(level=settings.LOG_LEVEL)
-    app = FastAPI(title="Clinic AI Agent v2")
+    app = FastAPI(title="Clinic AI Agent v2", lifespan=lifespan)
 
     @app.get("/")
     async def health() -> dict[str, str]:
