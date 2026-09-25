@@ -25,3 +25,20 @@ def test_no_phone_omits_phone_line_but_keeps_date():
     assert "WhatsApp number" not in out
     assert "Today's date is" in out
     assert out.strip().endswith("Hello")
+
+
+def test_prior_tool_results_are_surfaced_for_recall():
+    history = [
+        {"role": "user", "content": "book me with Dr Asha tomorrow 9:30"},
+        {
+            "role": "assistant",
+            "content": "Booked!",
+            "tools": [
+                {"name": "book_appointment", "result": {"appointmentId": "abc123", "slot": "09:30"}}
+            ],
+        },
+    ]
+    out = contextualize("what's my appointment id?", history, "919")
+    assert "tool results:" in out
+    assert "book_appointment" in out
+    assert "abc123" in out  # the id is recallable from replayed history

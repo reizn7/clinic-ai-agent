@@ -7,6 +7,7 @@ into the message, mirroring nextdim's text cold-start seeding.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -50,8 +51,19 @@ def contextualize(message: str, history: list[dict], phone: str) -> str:
 
     lines = []
     for turn in history:
-        who = "Patient" if turn.get("role") == "user" else "Assistant"
-        lines.append(f"{who}: {turn.get('content', '')}")
+        if turn.get("role") == "user":
+            lines.append(f"Patient: {turn.get('content', '')}")
+            continue
+        line = f"Assistant: {turn.get('content', '')}"
+        tools = turn.get("tools")
+        if tools:
+            # Surface prior tool RESULTS so the model can recall them (e.g. an
+            # appointment id or slots it looked up earlier).
+            summary = "; ".join(
+                f"{t.get('name')} → {json.dumps(t.get('result'), default=str)}" for t in tools
+            )
+            line += f"\n  (tool results: {summary})"
+        lines.append(line)
     prior = "\n".join(lines)
     return (
         f"{identity}"
@@ -126,14 +138,15 @@ async def run_turn(phone: str, message: str) -> str:
         log.exception("Turn failed for %s", phone)
         latency_ms = round((time.perf_counter() - t0) * 1000)
         # Record the failed turn in both stores so we're not blind to it.
-        await append_turn(phone, message, FALLBACK_REPLY)
+        await append_turn(phone, message, FALLBACK_REPLY, tool_calls)
         await conversations.record_turn(phone, message, FALLBACK_REPLY, tool_calls, latency_ms)
         return FALLBACK_REPLY
 
     latency_ms = round((time.perf_counter() - t0) * 1000)
     reply = reply.strip() or FALLBACK_REPLY
 
-    # transcripts: lean prompt-history; conversations: full console record.
-    await append_turn(phone, message, reply)
+    # transcripts: lean prompt-history (+ tool results for recall);
+    # conversations: full console record.
+    await append_turn(phone, message, reply, tool_calls)
     await conversations.record_turn(phone, message, reply, tool_calls, latency_ms)
     return reply

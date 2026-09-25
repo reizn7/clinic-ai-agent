@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, Request, Response
 
 from clinic_agent.config import settings
+from clinic_agent.runtime import debounce
 from clinic_agent.runtime.turn import run_turn
 from clinic_agent.whatsapp.client import send_text_message
 
@@ -68,5 +69,9 @@ async def incoming(request: Request, background: BackgroundTasks) -> Response:
     log.info("Message from %s: %s", phone, text)
 
     if phone:
-        background.add_task(_reply, phone, text)
+        if settings.DEBOUNCE_ENABLED:
+            # Buffer the bubble; the flusher coalesces rapid messages into one turn.
+            await debounce.enqueue(phone, text)
+        else:
+            background.add_task(_reply, phone, text)
     return Response(status_code=200)

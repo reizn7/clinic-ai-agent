@@ -28,8 +28,20 @@ def _get_history_sync(phone: str) -> list[dict]:
     return messages[-MAX_HISTORY_MESSAGES:]
 
 
-def _append_turn_sync(phone: str, user_text: str, assistant_text: str) -> None:
+def _append_turn_sync(
+    phone: str,
+    user_text: str,
+    assistant_text: str,
+    tool_calls: list[dict] | None = None,
+) -> None:
     now = datetime.now(UTC)
+    assistant_msg: dict = {"role": "assistant", "content": assistant_text, "ts": now}
+    if tool_calls:
+        # Compact tool summary so history replay can recall prior tool RESULTS
+        # (e.g. an appointment id booked two turns ago), not just the prose.
+        assistant_msg["tools"] = [
+            {"name": c.get("name"), "result": c.get("result")} for c in tool_calls
+        ]
     get_db()[_COLLECTION].update_one(
         {"phone": phone},
         {
@@ -37,7 +49,7 @@ def _append_turn_sync(phone: str, user_text: str, assistant_text: str) -> None:
                 "messages": {
                     "$each": [
                         {"role": "user", "content": user_text, "ts": now},
-                        {"role": "assistant", "content": assistant_text, "ts": now},
+                        assistant_msg,
                     ]
                 }
             },
@@ -53,6 +65,15 @@ async def get_history(phone: str) -> list[dict]:
     return await asyncio.to_thread(_get_history_sync, phone)
 
 
-async def append_turn(phone: str, user_text: str, assistant_text: str) -> None:
-    """Persist the user message + the agent's reply for prompt-history seeding."""
-    await asyncio.to_thread(_append_turn_sync, phone, user_text, assistant_text)
+async def append_turn(
+    phone: str,
+    user_text: str,
+    assistant_text: str,
+    tool_calls: list[dict] | None = None,
+) -> None:
+    """Persist the user message + the agent's reply for prompt-history seeding.
+
+    ``tool_calls`` (this turn's captured calls) are stored in compact form so
+    the next turn's context can recall prior tool results.
+    """
+    await asyncio.to_thread(_append_turn_sync, phone, user_text, assistant_text, tool_calls)

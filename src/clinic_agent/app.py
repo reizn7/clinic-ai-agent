@@ -14,20 +14,25 @@ load_dotenv()
 from fastapi import FastAPI  # noqa: E402
 
 from clinic_agent.config import settings  # noqa: E402
-from clinic_agent.runtime import sweeper  # noqa: E402
+from clinic_agent.runtime import flusher, sweeper  # noqa: E402
 from clinic_agent.whatsapp.webhook import router as webhook_router  # noqa: E402
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Background idle sweeper: finalize conversations + generate analytics.
-    task = asyncio.create_task(sweeper.run_forever())
+    # Background loops: idle sweeper (finalize + analytics) and debounce flusher.
+    tasks = [
+        asyncio.create_task(sweeper.run_forever()),
+        asyncio.create_task(flusher.run_forever()),
+    ]
     try:
         yield
     finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 def create_app() -> FastAPI:

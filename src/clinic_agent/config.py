@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     SWEEP_SECONDS: int = 60  # how often the background sweeper runs
     ANALYTICS_STUCK_MINUTES: int = 10  # reclaim analytics stuck in "processing"
 
+    # --- Inbound debounce (coalesce rapid WhatsApp bubbles) ---
+    DEBOUNCE_ENABLED: bool = True
+    DEBOUNCE_WINDOW_SECONDS: float = 5.0  # quiet gap before flushing a batch
+    DEBOUNCE_MAX_WAIT_SECONDS: float = 30.0  # hard cap even if still typing
+    DEBOUNCE_TICK_SECONDS: float = 1.0  # how often the flusher polls
+
     # --- App ---
     LOG_LEVEL: str = "INFO"
     PORT: int = 3000

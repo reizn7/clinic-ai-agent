@@ -34,7 +34,23 @@ def test_verify_handshake_rejects_bad_token(monkeypatch):
     assert r.status_code == 403
 
 
-def test_inbound_message_triggers_agent_and_send(monkeypatch):
+def test_inbound_message_enqueues_debounce(monkeypatch):
+    monkeypatch.setattr(config.settings, "DEBOUNCE_ENABLED", True)
+    enqueued = {}
+
+    async def fake_enqueue(phone, text):
+        enqueued["phone"] = phone
+        enqueued["text"] = text
+
+    monkeypatch.setattr(webhook.debounce, "enqueue", fake_enqueue)
+
+    r = client.post("/webhook", json=_msg_payload("book please"))
+    assert r.status_code == 200
+    assert enqueued == {"phone": "919999999999", "text": "book please"}
+
+
+def test_inbound_immediate_when_debounce_disabled(monkeypatch):
+    monkeypatch.setattr(config.settings, "DEBOUNCE_ENABLED", False)
     sent = {}
 
     async def fake_run_turn(phone, text):
@@ -49,8 +65,7 @@ def test_inbound_message_triggers_agent_and_send(monkeypatch):
 
     r = client.post("/webhook", json=_msg_payload("book please"))
     assert r.status_code == 200
-    assert sent["to"] == "919999999999"
-    assert sent["body"] == "reply to book please"
+    assert sent == {"to": "919999999999", "body": "reply to book please"}
 
 
 def test_status_callback_is_acked_without_agent(monkeypatch):
