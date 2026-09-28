@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # --- LLM (Gemini via AI Studio key; no GCP) ---
     GOOGLE_API_KEY: str = ""
     GOOGLE_GENAI_USE_VERTEXAI: bool = False
-    MODEL: str = "gemini-2.5-flash"
+    MODEL: str = "gemini-3.5-flash-lite"
 
     # --- Storage (MongoDB) ---
     MONGO_URI: str = Field(

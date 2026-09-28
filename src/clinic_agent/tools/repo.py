@@ -6,13 +6,13 @@ via ``asyncio.to_thread``. Ported from v1's Mongoose models/services.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo.errors import DuplicateKeyError
 
-from clinic_agent.db import get_db
+from clinic_agent.db import create_index_safe, get_db
 from clinic_agent.tools.slots import available_slots, generate_slots
 
 WEEKDAYS = [
@@ -40,19 +40,24 @@ def ensure_indexes() -> None:
     non-cancelled appointments. Safe to call repeatedly."""
     # Partial indexes only allow a limited operator set — $nin/$not is rejected,
     # so express "non-cancelled" as $in over the active statuses (equivalent).
-    get_db()["appointments"].create_index(
+    create_index_safe(
+        get_db()["appointments"],
         [("doctorId", 1), ("date", 1), ("slot", 1)],
         unique=True,
         partialFilterExpression={"status": {"$in": ACTIVE_STATUSES}},
         name="uniq_active_slot",
     )
-    get_db()["patients"].create_index("phone", unique=True, name="uniq_phone")
+    create_index_safe(get_db()["patients"], "phone", unique=True, name="uniq_phone")
 
 
 def _weekday_name(date_key: str) -> str:
     # Python: Monday=0..Sunday=6; our WEEKDAYS list is Sunday-first (Date.getDay()).
     dt = datetime.strptime(date_key, "%Y-%m-%d")
     return WEEKDAYS[(dt.weekday() + 1) % 7]
+
+
+def _today_key() -> str:
+    return date.today().isoformat()
 
 
 def get_clinic() -> dict:
@@ -88,6 +93,14 @@ def get_available_slots(doctor_name: str, date_key: str) -> dict:
     if not doctor:
         return {"error": f"No active doctor named '{doctor_name}'."}
 
+    if date_key < _today_key():
+        return {
+            "doctor": doctor["name"],
+            "date": date_key,
+            "slots": [],
+            "note": "That date is in the past. Please pick today or a future date.",
+        }
+
     day = _weekday_name(date_key)
     if day not in (doctor.get("availableDays") or []):
         return {
@@ -116,6 +129,33 @@ def get_available_slots(doctor_name: str, date_key: str) -> dict:
     }
 
 
+def get_upcoming_availability(doctor_name: str, count: int = 3) -> dict:
+    """Next `count` upcoming dates (from tomorrow) where the doctor has free slots."""
+    doctor = _find_doctor_by_name(doctor_name)
+    if not doctor:
+        return {"error": f"No active doctor named '{doctor_name}'."}
+
+    results: list[dict] = []
+    cursor = date.today()
+    guard = 0
+    while len(results) < count and guard < 60:
+        cursor += timedelta(days=1)
+        guard += 1
+        date_key = cursor.isoformat()
+        if _weekday_name(date_key) not in (doctor.get("availableDays") or []):
+            continue
+        avail = get_available_slots(doctor_name, date_key)
+        if avail.get("slots"):
+            results.append(
+                {
+                    "date": date_key,
+                    "weekday": avail["weekday"],
+                    "slots": avail["slots"][:6],  # first few, to keep replies short
+                }
+            )
+    return {"doctor": doctor["name"], "dates": results}
+
+
 def _upsert_patient(phone: str, name: str, age: int, gender: str) -> ObjectId:
     now = datetime.now(UTC)
     res = get_db()["patients"].find_one_and_update(
@@ -136,6 +176,17 @@ def create_appointment(
     doctor = _find_doctor_by_name(doctor_name)
     if not doctor:
         return {"success": False, "error": f"No active doctor named '{doctor_name}'."}
+
+    # Validate the slot is genuinely bookable (future, a working day, a real free
+    # slot) before writing — clearer than relying on the unique index alone.
+    avail = get_available_slots(doctor_name, date_key)
+    if slot not in avail.get("slots", []):
+        return {
+            "success": False,
+            "error": avail.get("note")
+            or f"{slot} isn't an available slot for Dr. {doctor['name']} on {date_key}.",
+            "available_slots": avail.get("slots", []),
+        }
 
     patient_id = _upsert_patient(phone, name, age, gender)
     try:
@@ -202,3 +253,44 @@ def cancel_appointment(appointment_id: str) -> dict:
     if res.matched_count == 0:
         return {"success": False, "error": "Appointment not found."}
     return {"success": True, "appointmentId": appointment_id, "status": "Cancelled"}
+
+
+def reschedule_appointment(appointment_id: str, new_date: str, new_slot: str) -> dict:
+    """Move an existing (non-cancelled) appointment to a new date + slot."""
+    try:
+        oid = ObjectId(appointment_id)
+    except (InvalidId, TypeError):
+        return {"success": False, "error": "Invalid appointment id."}
+
+    appt = get_db()["appointments"].find_one({"_id": oid})
+    if not appt or appt["status"] == "Cancelled":
+        return {"success": False, "error": "Appointment not found."}
+    doctor = get_db()["doctors"].find_one({"_id": appt["doctorId"]})
+    if not doctor:
+        return {"success": False, "error": "That doctor is no longer available."}
+
+    avail = get_available_slots(doctor["name"], new_date)
+    if new_slot not in avail.get("slots", []):
+        return {
+            "success": False,
+            "error": avail.get("note")
+            or f"{new_slot} isn't available for Dr. {doctor['name']} on {new_date}.",
+            "available_slots": avail.get("slots", []),
+        }
+
+    try:
+        get_db()["appointments"].update_one(
+            {"_id": oid},
+            {"$set": {"date": new_date, "slot": new_slot, "updatedAt": datetime.now(UTC)}},
+        )
+    except DuplicateKeyError:
+        return {"success": False, "conflict": True, "error": "That slot has just been taken."}
+    return {
+        "success": True,
+        "appointmentId": appointment_id,
+        "doctor": doctor["name"],
+        "date": new_date,
+        "weekday": _weekday_name(new_date),
+        "slot": new_slot,
+        "status": appt["status"],
+    }

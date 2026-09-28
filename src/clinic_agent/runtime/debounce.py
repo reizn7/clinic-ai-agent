@@ -23,15 +23,15 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 from clinic_agent.config import settings
-from clinic_agent.db import get_db
+from clinic_agent.db import create_index_safe, get_db
 
 COLLECTION = "pending_messages"
 
 
 def ensure_indexes() -> None:
     col = get_db()[COLLECTION]
-    col.create_index("phone", unique=True, name="uniq_pending_phone")
-    col.create_index("deadline", name="pending_deadline")
+    create_index_safe(col, "phone", unique=True, name="uniq_pending_phone")
+    create_index_safe(col, "deadline", name="pending_deadline")
 
 
 def _enqueue_sync(phone: str, text: str, now: datetime) -> None:

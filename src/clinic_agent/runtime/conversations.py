@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 from pymongo import ReturnDocument
 
 from clinic_agent.config import settings
-from clinic_agent.db import get_db
+from clinic_agent.db import create_index_safe, get_db
 
 if TYPE_CHECKING:
     from clinic_agent.runtime.analytics import ConversationAnalytics
@@ -43,7 +43,9 @@ CHANNEL = "whatsapp"
 _TOOL_INTENT = {
     "book_appointment": "book_appointment",
     "cancel_appointment": "cancel_appointment",
+    "reschedule_appointment": "reschedule_appointment",
     "check_availability": "doctor_availability",
+    "find_next_available": "doctor_availability",
     "get_clinic_info": "clinic_info",
     "list_doctors": "clinic_info",
     "list_my_appointments": "other",
@@ -54,11 +56,11 @@ _INFO_TOOLS = {"get_clinic_info", "list_doctors", "list_my_appointments"}
 
 def ensure_indexes() -> None:
     col = get_db()[COLLECTION]
-    col.create_index("externalId", unique=True, name="uniq_externalId")
-    col.create_index([("clinicId", 1), ("startedAt", -1)], name="clinic_started")
-    col.create_index([("clinicId", 1), ("outcome", 1), ("startedAt", -1)], name="clinic_outcome")
-    col.create_index([("clinicId", 1), ("escalated", 1), ("startedAt", -1)], name="clinic_escalated")
-    col.create_index([("phone", 1), ("startedAt", -1)], name="phone_started")
+    create_index_safe(col, "externalId", unique=True, name="uniq_externalId")
+    create_index_safe(col, [("clinicId", 1), ("startedAt", -1)], name="clinic_started")
+    create_index_safe(col, [("clinicId", 1), ("outcome", 1), ("startedAt", -1)], name="clinic_outcome")
+    create_index_safe(col, [("clinicId", 1), ("escalated", 1), ("startedAt", -1)], name="clinic_escalated")
+    create_index_safe(col, [("phone", 1), ("startedAt", -1)], name="phone_started")
 
 
 # ---- derivations (pure) ---------------------------------------------------
@@ -76,7 +78,8 @@ def _succeeded(calls: list[dict], name: str) -> bool:
 def derive_outcome(calls: list[dict]) -> str:
     booked = _succeeded(calls, "book_appointment")
     cancelled = _succeeded(calls, "cancel_appointment")
-    if booked and cancelled:
+    rescheduled = _succeeded(calls, "reschedule_appointment")
+    if rescheduled or (booked and cancelled):
         return "appointment_rescheduled"
     if booked:
         return "appointment_booked"
@@ -344,7 +347,11 @@ def _record_turn_sync(
                 "appointmentAt": _appointment_at(all_calls),
                 "escalated": escalated,
                 "escalationReason": escalation_reason(all_calls),
-                "status": "escalated" if escalated else "active",
+                # Stay OPEN through escalation — the `escalated` flag drives the
+                # console follow-up queue; the final "escalated" status is set
+                # when the sweeper closes the conversation on idle. This keeps a
+                # continued chat in ONE conversation instead of splitting it.
+                "status": "active",
             },
         },
     )

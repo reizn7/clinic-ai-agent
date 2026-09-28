@@ -38,14 +38,27 @@ CHECK_ERR = {
 # ---- pure derivations -----------------------------------------------------
 
 
+RESCHEDULE_OK = {
+    "name": "reschedule_appointment",
+    "args": {"appointment_id": "abc", "new_date": "2026-10-15", "new_slot": "10:00"},
+    "result": {"success": True},
+    "status": "success",
+}
+
+
 def test_derive_outcome_variants():
     assert conv.derive_outcome([BOOK_OK]) == "appointment_booked"
     assert conv.derive_outcome([CANCEL_OK]) == "appointment_cancelled"
     assert conv.derive_outcome([CANCEL_OK, BOOK_OK]) == "appointment_rescheduled"
+    assert conv.derive_outcome([RESCHEDULE_OK]) == "appointment_rescheduled"
     assert conv.derive_outcome([ESCALATE_OK]) == "escalated"
     assert conv.derive_outcome([INFO_OK]) == "info_provided"
     assert conv.derive_outcome([CHECK_ERR]) == "no_resolution"
     assert conv.derive_outcome([]) == "no_resolution"
+
+
+def test_reschedule_intent_mapped():
+    assert conv.derive_intents([RESCHEDULE_OK]) == ["reschedule_appointment"]
 
 
 def test_derive_intents_ordered_unique():
@@ -106,12 +119,22 @@ def test_error_tool_call_records_error_and_null_result(db):
     assert tool["error"] == "No active doctor named 'Ghost'."
 
 
-def test_escalation_sets_status_and_reason(db):
+def test_escalation_flags_but_keeps_conversation_open(db):
     conv._record_turn_sync("919", "get me a person", "Connecting you.", [ESCALATE_OK], 90)
     doc = db["conversations"].find_one({"phone": "+919"})
-    assert doc["status"] == "escalated"
+    # Flagged for the follow-up queue, but NOT closed — a continued chat stays
+    # in this same conversation (final "escalated" status is set at idle close).
     assert doc["escalated"] is True
     assert doc["escalationReason"] == "billing"
+    assert doc["status"] == "active"
+
+
+def test_continued_chat_after_escalation_stays_one_conversation(db):
+    conv._record_turn_sync("919", "get me a person", "Connecting you.", [ESCALATE_OK], 90)
+    conv._record_turn_sync("919", "actually, book me instead", "Sure!", [BOOK_OK], 80)
+    docs = list(db["conversations"].find({"phone": "+919"}))
+    assert len(docs) == 1  # not split into two
+    assert conv._final_status(conv._calls_from_messages(docs[0]["messages"])) == "escalated"
 
 
 def test_idle_timeout_rotates_conversation(db):

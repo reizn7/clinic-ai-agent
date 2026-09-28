@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 import mongomock
 import pytest
 from bson import ObjectId
@@ -24,9 +26,19 @@ def db(monkeypatch):
     return fake
 
 
-# 2026-08-10 is a Monday; 2026-08-09 is a Sunday.
-MON = "2026-08-10"
-SUN = "2026-08-09"
+def _next_weekday(py_weekday: int) -> str:
+    """The next FUTURE date (from tomorrow) matching a Python weekday (Mon=0)."""
+    d = date.today() + timedelta(days=1)
+    for _ in range(14):
+        if d.weekday() == py_weekday:
+            return d.isoformat()
+        d += timedelta(days=1)
+    raise AssertionError("unreachable")
+
+
+MON = _next_weekday(0)  # a future Monday (doctor works)
+SUN = _next_weekday(6)  # a future Sunday (doctor off)
+PAST = (date.today() - timedelta(days=1)).isoformat()
 
 
 def test_list_active_doctors(db):
@@ -102,3 +114,45 @@ def test_cancel_stamps_cancelled_at(db):
     repo.cancel_appointment(booked["appointmentId"])
     appt = db["appointments"].find_one({"_id": ObjectId(booked["appointmentId"])})
     assert "cancelledAt" in appt
+
+
+def test_availability_rejects_past_date(db):
+    res = repo.get_available_slots("Asha Mehta", PAST)
+    assert res["slots"] == []
+    assert "past" in res["note"].lower()
+
+
+def test_book_rejects_past_date(db):
+    res = repo.create_appointment("919", "Ravi", 30, "Male", "Asha Mehta", PAST, "09:00")
+    assert res["success"] is False
+
+
+def test_book_rejects_invalid_slot(db):
+    # 08:00 is outside the doctor's 09:00-11:00 window.
+    res = repo.create_appointment("919", "Ravi", 30, "Male", "Asha Mehta", MON, "08:00")
+    assert res["success"] is False
+    assert "available_slots" in res
+
+
+def test_upcoming_availability_returns_working_dates(db):
+    res = repo.get_upcoming_availability("Asha Mehta", 2)
+    assert len(res["dates"]) == 2
+    for d in res["dates"]:
+        assert d["weekday"] in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        assert d["slots"]
+
+
+def test_reschedule_moves_appointment(db):
+    booked = repo.create_appointment("919", "Ravi", 30, "Male", "Asha Mehta", MON, "09:30")
+    res = repo.reschedule_appointment(booked["appointmentId"], MON, "10:30")
+    assert res["success"] is True
+    assert res["slot"] == "10:30"
+    # Old slot freed, new slot taken.
+    slots = repo.get_available_slots("Asha Mehta", MON)["slots"]
+    assert "09:30" in slots and "10:30" not in slots
+
+
+def test_reschedule_rejects_unavailable_slot(db):
+    booked = repo.create_appointment("919", "Ravi", 30, "Male", "Asha Mehta", MON, "09:30")
+    res = repo.reschedule_appointment(booked["appointmentId"], SUN, "09:00")  # off day
+    assert res["success"] is False

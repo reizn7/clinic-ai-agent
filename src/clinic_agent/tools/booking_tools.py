@@ -35,6 +35,17 @@ async def check_availability(doctor_name: str, date: str) -> dict:
     return await asyncio.to_thread(repo.get_available_slots, doctor_name, date)
 
 
+async def find_next_available(doctor_name: str) -> dict:
+    """Find the next upcoming dates a doctor has open slots, when the patient
+    isn't sure of an exact date (e.g. "sometime this week"). Returns a few dates
+    with their free slots.
+
+    Args:
+        doctor_name: The doctor's name (without the "Dr." prefix).
+    """
+    return await asyncio.to_thread(repo.get_upcoming_availability, doctor_name, 3)
+
+
 async def book_appointment(
     patient_name: str,
     age: int,
@@ -79,6 +90,20 @@ async def cancel_appointment(appointment_id: str) -> dict:
     return await asyncio.to_thread(repo.cancel_appointment, appointment_id)
 
 
+async def reschedule_appointment(appointment_id: str, new_date: str, new_slot: str) -> dict:
+    """Move an existing appointment to a new date and time, after confirming the
+    new slot with the patient.
+
+    Args:
+        appointment_id: The appointment id (from list_my_appointments).
+        new_date: The new date, formatted as YYYY-MM-DD.
+        new_slot: The new slot start time, formatted as HH:mm.
+    """
+    return await asyncio.to_thread(
+        repo.reschedule_appointment, appointment_id, new_date, new_slot
+    )
+
+
 async def escalate_to_human(reason: str) -> dict:
     """Hand off to the clinic's human team when the patient asks for a human or
     has an urgent/clinical concern the agent cannot handle.
@@ -99,8 +124,10 @@ ALL_TOOLS = [
     get_clinic_info,
     list_doctors,
     check_availability,
+    find_next_available,
     book_appointment,
     list_my_appointments,
+    reschedule_appointment,
     cancel_appointment,
     escalate_to_human,
 ]

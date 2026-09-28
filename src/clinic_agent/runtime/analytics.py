@@ -12,6 +12,7 @@ has ended. Synchronous (google-genai is sync); callers use ``asyncio.to_thread``
 from __future__ import annotations
 
 import logging
+import re
 from typing import Literal
 
 from google import genai
@@ -21,6 +22,19 @@ from pydantic import BaseModel
 from clinic_agent.config import settings
 
 log = logging.getLogger("clinic_agent.runtime.analytics")
+
+
+def _minimal_thinking() -> types.ThinkingConfig:
+    """Low-thinking config for the configured model family.
+
+    Gemini 3.x uses ``thinking_level`` and REJECTS ``thinking_budget`` (400);
+    2.x uses ``thinking_budget``. Keeping this correct avoids a hard failure
+    when the model is switched.
+    """
+    m = re.search(r"gemini-(\d+)", settings.MODEL or "")
+    if m and int(m.group(1)) >= 3:
+        return types.ThinkingConfig(thinking_level="LOW")
+    return types.ThinkingConfig(thinking_budget=0)
 
 
 class ConversationAnalytics(BaseModel):
@@ -62,7 +76,7 @@ def generate_analytics(transcript: str) -> ConversationAnalytics | None:
                 temperature=0.2,
                 response_mime_type="application/json",
                 response_schema=ConversationAnalytics,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                thinking_config=_minimal_thinking(),
             ),
         )
         parsed = resp.parsed
