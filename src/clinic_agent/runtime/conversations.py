@@ -1,8 +1,13 @@
 """Console-facing ``conversations`` collection writer.
 
 Implements the staff-console data contract: one document per *conversation*
-(not per phone), sessionised by a 30-minute idle window, written to a separate
-``conversations`` collection alongside the agent's own ``transcripts``.
+(not per phone), written to a separate ``conversations`` collection alongside
+the agent's own ``transcripts``. ``channel`` says where it happened:
+
+* ``whatsapp`` — sessionised by a 30-minute idle window (``record_turn``).
+* ``voice`` — exactly one conversation per phone call, no rotation
+  (``start_call`` on connect, ``finish_call`` on hangup), plus ``callSid`` and
+  ``durationSec``. WhatsApp sessionisation never picks up a voice conversation.
 
 Derived fields (outcome, intents, doctorName, appointmentAt, escalation) are
 computed here from the captured tool calls — no extra LLM call. Nice-to-have
@@ -31,6 +36,7 @@ from pymongo import ReturnDocument
 
 from clinic_agent.config import settings
 from clinic_agent.db import create_index_safe, get_db
+from clinic_agent.phone import to_e164
 
 if TYPE_CHECKING:
     from clinic_agent.runtime.analytics import ConversationAnalytics
@@ -38,6 +44,9 @@ if TYPE_CHECKING:
 COLLECTION = "conversations"
 IDLE_TIMEOUT = timedelta(minutes=30)
 CHANNEL = "whatsapp"
+VOICE_CHANNEL = "voice"
+# Text marker for a voice turn the agent opened (its greeting): no caller speech.
+CALL_STARTED = "[phone call started]"
 
 # tool name → primaryIntent enum (closed set in the contract §4).
 _TOOL_INTENT = {
@@ -67,8 +76,7 @@ def ensure_indexes() -> None:
 
 
 def _to_e164(phone: str) -> str:
-    p = phone.strip()
-    return p if p.startswith("+") else f"+{p}"
+    return to_e164(phone)
 
 
 def _succeeded(calls: list[dict], name: str) -> bool:
@@ -195,6 +203,19 @@ def _build_turn_messages(
     return messages
 
 
+def _derived_fields(all_calls: list[dict]) -> dict[str, Any]:
+    """Console fields recomputed from every tool call in a conversation."""
+    return {
+        "outcome": derive_outcome(all_calls),
+        "primaryIntent": (derive_intents(all_calls) or ["other"])[0],
+        "intents": derive_intents(all_calls),
+        "doctorName": _doctor_name(all_calls),
+        "appointmentAt": _appointment_at(all_calls),
+        "escalated": _succeeded(all_calls, "escalate_to_human"),
+        "escalationReason": escalation_reason(all_calls),
+    }
+
+
 def _patient_name(phone: str) -> str:
     doc = get_db()["patients"].find_one({"phone": phone}, {"name": 1})
     return (doc or {}).get("name") or "Unknown"
@@ -295,7 +316,11 @@ def _record_turn_sync(
     now = datetime.now(UTC)
     e164 = _to_e164(phone)
 
-    conv = col.find_one({"phone": e164, "status": "active"}, sort=[("startedAt", -1)])
+    # Voice calls are their own conversations; never append WhatsApp turns to one.
+    conv = col.find_one(
+        {"phone": e164, "status": "active", "channel": {"$ne": VOICE_CHANNEL}},
+        sort=[("startedAt", -1)],
+    )
 
     if conv:
         msgs = conv.get("messages", [])
@@ -331,7 +356,6 @@ def _record_turn_sync(
 
     all_calls = _calls_from_messages(conv.get("messages", [])) + tool_calls
     turn_messages = _build_turn_messages(patient_text, agent_reply, tool_calls, latency_ms, now)
-    escalated = _succeeded(all_calls, "escalate_to_human")
 
     col.update_one(
         {"externalId": conv["externalId"]},
@@ -340,13 +364,7 @@ def _record_turn_sync(
             "$set": {
                 "endedAt": now.isoformat(),
                 "patientName": _patient_name(phone),
-                "outcome": derive_outcome(all_calls),
-                "primaryIntent": (derive_intents(all_calls) or ["other"])[0],
-                "intents": derive_intents(all_calls),
-                "doctorName": _doctor_name(all_calls),
-                "appointmentAt": _appointment_at(all_calls),
-                "escalated": escalated,
-                "escalationReason": escalation_reason(all_calls),
+                **_derived_fields(all_calls),
                 # Stay OPEN through escalation — the `escalated` flag drives the
                 # console follow-up queue; the final "escalated" status is set
                 # when the sweeper closes the conversation on idle. This keeps a
@@ -368,3 +386,88 @@ async def record_turn(
     await asyncio.to_thread(
         _record_turn_sync, phone, patient_text, agent_reply, tool_calls, latency_ms
     )
+
+
+# ---- voice calls (one conversation per call) ------------------------------
+
+
+def _start_call_sync(phone: str, call_sid: str, started_at: datetime) -> str:
+    external_id = f"conv_{uuid.uuid4().hex}"
+    ts = started_at.isoformat()
+    get_db()[COLLECTION].insert_one(
+        {
+            "externalId": external_id,
+            "clinicId": settings.CLINIC_ID,
+            "channel": VOICE_CHANNEL,
+            "callSid": call_sid,
+            "phone": _to_e164(phone) if phone else "",
+            "patientName": _patient_name(phone) if phone else "Unknown",
+            "startedAt": ts,
+            "endedAt": ts,
+            "status": "active",
+            "messages": [],
+            "intents": [],
+            "tags": [],
+        }
+    )
+    return external_id
+
+
+def _voice_turn_messages(turn: dict) -> list[dict]:
+    """Console messages for one voice turn; empty text lines are dropped."""
+    user = turn.get("user", "")
+    msgs = _build_turn_messages(
+        "" if user == CALL_STARTED else user,
+        turn.get("assistant", ""),
+        turn.get("tools") or [],
+        None,
+        turn.get("ts") or datetime.now(UTC),
+    )
+    return [m for m in msgs if m["type"] != "text" or m["content"]]
+
+
+def _finish_call_sync(
+    external_id: str,
+    phone: str,
+    turns: list[dict],
+    started_at: datetime,
+    ended_at: datetime,
+) -> None:
+    messages = [m for t in turns for m in _voice_turn_messages(t)]
+    all_calls = [c for t in turns for c in t.get("tools") or []]
+    get_db()[COLLECTION].update_one(
+        {"externalId": external_id},
+        {
+            "$set": {
+                "messages": messages,
+                "endedAt": ended_at.isoformat(),
+                "durationSec": max(0, round((ended_at - started_at).total_seconds())),
+                "patientName": _patient_name(phone) if phone else "Unknown",
+                **_derived_fields(all_calls),
+                # Finalized on hangup — immediately eligible for analytics.
+                "status": _final_status(all_calls),
+            },
+            # If the sweeper closed (and analysed) it mid-call, redo analytics on
+            # the full call.
+            "$unset": {"analyticsStatus": "", "analyticsStartedAt": ""},
+        },
+    )
+
+
+async def start_call(phone: str, call_sid: str, started_at: datetime) -> str:
+    """Open the (single) ``active`` voice conversation for a call; return its id."""
+    return await asyncio.to_thread(_start_call_sync, phone, call_sid, started_at)
+
+
+async def finish_call(
+    external_id: str,
+    phone: str,
+    turns: list[dict],
+    started_at: datetime,
+    ended_at: datetime,
+) -> None:
+    """Write a finished call's turns + derived fields and finalize its status.
+
+    ``turns``: ``[{user, assistant, tools: [tool-call records], ts}]`` in order.
+    """
+    await asyncio.to_thread(_finish_call_sync, external_id, phone, turns, started_at, ended_at)

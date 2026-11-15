@@ -28,3 +28,9 @@ def get_model() -> str:
     """Return the ADK model identifier to use (e.g. ``gemini-2.5-flash``)."""
     configure_genai_env()
     return settings.MODEL
+
+
+def get_voice_model() -> str:
+    """Return the Live API native-audio model for the voice channel."""
+    configure_genai_env()
+    return settings.VOICE_MODEL
