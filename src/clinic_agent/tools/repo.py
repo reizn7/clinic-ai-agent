@@ -147,6 +147,17 @@ def _find_doctor_by_name(name: str) -> dict | None:
     )
 
 
+def _schedule(doctor: dict) -> dict:
+    """The doctor's regular week, so the agent can say which days they work
+    instead of guessing from a handful of open dates."""
+    days = set(doctor.get("availableDays") or [])
+    hours = doctor.get("workingHours") or {}
+    out: dict = {"workingDays": [d for d in (*WEEKDAYS[1:], WEEKDAYS[0]) if d in days]}
+    if hours.get("start") and hours.get("end"):
+        out["workingHours"] = f"{hours['start']}-{hours['end']}"
+    return out
+
+
 def get_available_slots(doctor_name: str, date_key: str) -> dict:
     doctor = _find_doctor_by_name(doctor_name)
     if not doctor:
@@ -168,6 +179,7 @@ def get_available_slots(doctor_name: str, date_key: str) -> dict:
             "weekday": day,
             "slots": [],
             "note": f"Dr. {doctor['name']} does not work on {day}.",
+            **_schedule(doctor),
         }
 
     all_slots = generate_slots(
@@ -187,6 +199,7 @@ def get_available_slots(doctor_name: str, date_key: str) -> dict:
         "date": date_key,
         "weekday": day,
         "slots": available_slots(all_slots, booked),
+        **_schedule(doctor),
     }
 
 
@@ -214,21 +227,27 @@ def get_upcoming_availability(doctor_name: str, count: int = 3) -> dict:
                     "slots": avail["slots"][:6],  # first few, to keep replies short
                 }
             )
-    return {"doctor": doctor["name"], "dates": results}
+    return {"doctor": doctor["name"], **_schedule(doctor), "dates": results}
 
 
-def _upsert_patient(phone: str, name: str, age: int, gender: str) -> ObjectId:
+def _upsert_patient(
+    phone: str, name: str, age: int, gender: str, *, update_profile: bool = True
+) -> ObjectId:
+    """Find-or-create the patient on ``phone``.
+
+    ``update_profile=False`` (an unverified voice caller) never changes an existing
+    patient's name/age/gender; they are only written when the patient is new.
+    """
     now = datetime.now(UTC)
+    details = {"name": name, "age": age, "gender": gender}
+    on_insert = {"phone": phone, "clinicId": settings.CLINIC_ID, "createdAt": now}
+    if update_profile:
+        update = {"$set": {**details, "updatedAt": now}, "$setOnInsert": on_insert}
+    else:
+        update = {"$setOnInsert": {**on_insert, **details, "updatedAt": now}}
     res = get_db()["patients"].find_one_and_update(
         _scoped({"phone": phone}),
-        {
-            "$set": {"name": name, "age": age, "gender": gender, "updatedAt": now},
-            "$setOnInsert": {
-                "phone": phone,
-                "clinicId": settings.CLINIC_ID,
-                "createdAt": now,
-            },
-        },
+        update,
         upsert=True,
         return_document=True,
     )
@@ -236,7 +255,15 @@ def _upsert_patient(phone: str, name: str, age: int, gender: str) -> ObjectId:
 
 
 def create_appointment(
-    phone: str, name: str, age: int, gender: str, doctor_name: str, date_key: str, slot: str
+    phone: str,
+    name: str,
+    age: int,
+    gender: str,
+    doctor_name: str,
+    date_key: str,
+    slot: str,
+    *,
+    update_profile: bool = True,
 ) -> dict:
     doctor = _find_doctor_by_name(doctor_name)
     if not doctor:
@@ -253,7 +280,7 @@ def create_appointment(
             "available_slots": avail.get("slots", []),
         }
 
-    patient_id = _upsert_patient(phone, name, age, gender)
+    patient_id = _upsert_patient(phone, name, age, gender, update_profile=update_profile)
     try:
         res = get_db()["appointments"].insert_one(
             {
@@ -307,18 +334,33 @@ def list_patient_appointments(phone: str) -> list[dict]:
     ]
 
 
-def cancel_appointment(appointment_id: str) -> dict:
+def _owned(oid: ObjectId, phone: str | None) -> dict:
+    """Query for appointment ``oid``, restricted to the patient on ``phone`` when given.
+
+    An appointment on someone else's number then simply reads as "not found", so
+    a caller cannot act on (or learn about) another patient's appointment.
+    """
+    query = {"_id": oid}
+    if phone is not None:
+        patient = get_db()["patients"].find_one(_scoped({"phone": phone}), {"_id": 1})
+        query["patientId"] = patient["_id"] if patient else None
+    return _scoped(query)
+
+
+def cancel_appointment(appointment_id: str, phone: str | None = None) -> dict:
+    """Cancel an appointment. With ``phone``, only one belonging to that patient."""
     try:
         oid = ObjectId(appointment_id)
     except InvalidId, TypeError:
         return {"success": False, "error": "Invalid appointment id."}
+    owned = _owned(oid, phone)
     now = datetime.now(UTC)
     res = get_db()["appointments"].update_one(
-        _scoped({"_id": oid, "status": {"$ne": "Cancelled"}}),
+        {**owned, "status": {"$ne": "Cancelled"}},
         {"$set": {"status": "Cancelled", "cancelledAt": now, "updatedAt": now}},
     )
     if res.matched_count == 0:
-        if get_db()["appointments"].find_one(_scoped({"_id": oid})):
+        if get_db()["appointments"].find_one(owned):
             # Already cancelled: idempotent success, no second notification.
             return {"success": True, "appointmentId": appointment_id, "status": "Cancelled"}
         return {"success": False, "error": "Appointment not found."}
@@ -330,14 +372,17 @@ def cancel_appointment(appointment_id: str) -> dict:
     }
 
 
-def reschedule_appointment(appointment_id: str, new_date: str, new_slot: str) -> dict:
-    """Move an existing (non-cancelled) appointment to a new date + slot."""
+def reschedule_appointment(
+    appointment_id: str, new_date: str, new_slot: str, phone: str | None = None
+) -> dict:
+    """Move an existing (non-cancelled) appointment to a new date + slot. With
+    ``phone``, only one belonging to that patient."""
     try:
         oid = ObjectId(appointment_id)
     except InvalidId, TypeError:
         return {"success": False, "error": "Invalid appointment id."}
 
-    appt = get_db()["appointments"].find_one(_scoped({"_id": oid}))
+    appt = get_db()["appointments"].find_one(_owned(oid, phone))
     if not appt or appt["status"] == "Cancelled":
         return {"success": False, "error": "Appointment not found."}
     doctor = get_db()["doctors"].find_one(_scoped({"_id": appt["doctorId"]}))

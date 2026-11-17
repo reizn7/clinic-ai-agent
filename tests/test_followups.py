@@ -194,6 +194,34 @@ async def test_template_used_when_configured(db, sent, calendar, monkeypatch):
     assert params[4] == booked["appointmentId"][-6:].upper()
 
 
+async def test_booked_confirmation_carries_the_security_code(db, sent, calendar):
+    _book()
+    await _drain()
+    code = db["patients"].find_one({"phone": PHONE})["accessCode"]
+    assert f"Security code: {code}" in sent[0][2]
+
+
+async def test_code_is_reused_and_left_out_of_cancellations(db, sent, calendar):
+    first = _book()
+    await _drain()
+    _book("10:00")
+    repo.cancel_appointment(first["appointmentId"])
+    await _drain()
+    code = db["patients"].find_one({"phone": PHONE})["accessCode"]
+    bodies = [body for _kind, _to, body in sent]
+    assert sum(f"Security code: {code}" in b for b in bodies) == 2  # both bookings
+    cancelled = next(b for b in bodies if "Appointment cancelled" in b)
+    assert code not in cancelled
+
+
+async def test_template_gets_the_code_as_sixth_param(db, sent, calendar, monkeypatch):
+    monkeypatch.setattr(settings, "WHATSAPP_TEMPLATE_BOOKED", "appointment_confirmation")
+    _book()
+    await _drain()
+    params = sent[0][4]
+    assert params[5] == db["patients"].find_one({"phone": PHONE})["accessCode"]
+
+
 # ---- calendar ----------------------------------------------------------------------
 
 

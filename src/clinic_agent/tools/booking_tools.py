@@ -2,6 +2,19 @@
 
 Thin async wrappers over ``repo`` (sync pymongo run in a thread). ADK builds each
 tool's schema from the function signature + docstring, so keep those accurate.
+
+**Caller identity comes from the session, never from the model.** The harness puts
+the caller's number in the ADK session state (``CALLER_PHONE``) when it creates the
+session: the WhatsApp sender, or the number typed on the voice call page. Tools
+read it from ``tool_context``; there is no ``phone`` argument the model could fill
+in with someone else's number. ADK injects ``tool_context`` and leaves it out of
+the tool schema.
+
+**Voice callers must verify before touching existing appointments.** A WhatsApp
+sender is proven by Meta; a voice caller's number is self-entered. On voice,
+``list_my_appointments`` / ``reschedule_appointment`` / ``cancel_appointment``
+refuse until ``verify_caller`` accepts the security code from the patient's
+WhatsApp confirmation, except for appointments booked earlier in the same call.
 """
 
 from __future__ import annotations
@@ -9,10 +22,50 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from google.adk.tools import ToolContext
+
+from clinic_agent.tools import access_code, repo
 from clinic_agent.tools import catalog as catalog_data
-from clinic_agent.tools import repo
 
 log = logging.getLogger("clinic_agent.tools")
+
+# ADK session-state keys, set by the harness (runtime.turn / voice.bridge).
+CALLER_PHONE = "caller_phone"
+CHANNEL = "channel"
+# Set by the tools themselves during a voice call.
+VERIFIED = "caller_verified"
+VERIFY_ATTEMPTS = "verify_attempts"
+BOOKED_THIS_CALL = "booked_this_call"
+
+MAX_ATTEMPTS_PER_CALL = 3
+
+_NO_CALLER = {
+    "success": False,
+    "error": "The caller's phone number is unknown, so this can't be done here.",
+}
+_VERIFY_FIRST = {
+    "success": False,
+    "verification_required": True,
+    "error": (
+        "Not verified. Ask the caller for the 6-digit security code from their "
+        "WhatsApp booking confirmation, then call verify_caller."
+    ),
+}
+
+
+def _caller(tool_context: ToolContext) -> str:
+    return str(tool_context.state.get(CALLER_PHONE) or "")
+
+
+def _verified(tool_context: ToolContext) -> bool:
+    """WhatsApp senders are verified by Meta; voice callers by verify_caller."""
+    if tool_context.state.get(CHANNEL) != "voice":
+        return True
+    return bool(tool_context.state.get(VERIFIED))
+
+
+def _booked_this_call(tool_context: ToolContext) -> list[str]:
+    return list(tool_context.state.get(BOOKED_THIS_CALL) or [])
 
 
 async def get_clinic_info() -> dict:
@@ -54,9 +107,10 @@ async def book_appointment(
     doctor_name: str,
     date: str,
     slot: str,
-    phone: str,
+    tool_context: ToolContext,
 ) -> dict:
-    """Book an appointment after the patient has confirmed the details.
+    """Book an appointment after the patient has confirmed the details. The
+    caller's phone number is attached automatically.
 
     Args:
         patient_name: The patient's full name.
@@ -65,33 +119,101 @@ async def book_appointment(
         doctor_name: The chosen doctor's name (without the "Dr." prefix).
         date: The appointment date, formatted as YYYY-MM-DD.
         slot: The chosen slot start time, formatted as HH:mm.
-        phone: The patient's WhatsApp phone number (from the conversation).
     """
-    return await asyncio.to_thread(
-        repo.create_appointment, phone, patient_name, age, gender, doctor_name, date, slot
+    phone = _caller(tool_context)
+    if not phone:
+        return _NO_CALLER
+    result = await asyncio.to_thread(
+        repo.create_appointment,
+        phone,
+        patient_name,
+        age,
+        gender,
+        doctor_name,
+        date,
+        slot,
+        # An unverified voice caller may book, but never rewrites an existing
+        # patient's name/age/gender.
+        update_profile=_verified(tool_context),
     )
+    if result.get("success"):
+        tool_context.state[BOOKED_THIS_CALL] = [
+            *_booked_this_call(tool_context),
+            result["appointmentId"],
+        ]
+    return result
 
 
-async def list_my_appointments(phone: str) -> dict:
-    """List the caller's upcoming (non-cancelled) appointments.
+async def verify_caller(code: str, tool_context: ToolContext) -> dict:
+    """Verify a phone caller with the 6-digit security code from their WhatsApp
+    booking confirmation. Needed on calls before looking up, rescheduling or
+    cancelling existing appointments.
 
     Args:
-        phone: The patient's WhatsApp phone number (from the conversation).
+        code: The digits the caller said, e.g. "482913".
     """
+    if _verified(tool_context):
+        return {"verified": True}
+    phone = _caller(tool_context)
+    if not phone:
+        return {**_NO_CALLER, "verified": False}
+    attempts = int(tool_context.state.get(VERIFY_ATTEMPTS) or 0)
+    if attempts >= MAX_ATTEMPTS_PER_CALL:
+        return {
+            "verified": False,
+            "error": "Too many attempts on this call. Offer escalate_to_human instead.",
+        }
+    tool_context.state[VERIFY_ATTEMPTS] = attempts + 1
+    result = await asyncio.to_thread(access_code.verify, phone, code)
+    if result["verified"]:
+        tool_context.state[VERIFIED] = True
+        return {"verified": True}
+    if result["reason"] == "locked":
+        return {
+            "verified": False,
+            "error": "Too many wrong codes for this number. It is locked for an hour.",
+        }
+    left = MAX_ATTEMPTS_PER_CALL - attempts - 1
+    return {
+        "verified": False,
+        "error": "That code doesn't match this number.",
+        "attempts_left": left,
+    }
+
+
+async def list_my_appointments(tool_context: ToolContext) -> dict:
+    """List the caller's upcoming (non-cancelled) appointments. The caller's phone
+    number is used automatically."""
+    phone = _caller(tool_context)
+    if not phone:
+        return _NO_CALLER
+    if not _verified(tool_context):
+        return _VERIFY_FIRST
     appts = await asyncio.to_thread(repo.list_patient_appointments, phone)
     return {"appointments": appts}
 
 
-async def cancel_appointment(appointment_id: str) -> dict:
+def _may_change(appointment_id: str, tool_context: ToolContext) -> bool:
+    return _verified(tool_context) or appointment_id in _booked_this_call(tool_context)
+
+
+async def cancel_appointment(appointment_id: str, tool_context: ToolContext) -> dict:
     """Cancel an existing appointment by its id.
 
     Args:
         appointment_id: The appointment id (from list_my_appointments).
     """
-    return await asyncio.to_thread(repo.cancel_appointment, appointment_id)
+    phone = _caller(tool_context)
+    if not phone:
+        return _NO_CALLER
+    if not _may_change(appointment_id, tool_context):
+        return _VERIFY_FIRST
+    return await asyncio.to_thread(repo.cancel_appointment, appointment_id, phone)
 
 
-async def reschedule_appointment(appointment_id: str, new_date: str, new_slot: str) -> dict:
+async def reschedule_appointment(
+    appointment_id: str, new_date: str, new_slot: str, tool_context: ToolContext
+) -> dict:
     """Move an existing appointment to a new date and time, after confirming the
     new slot with the patient.
 
@@ -100,8 +222,13 @@ async def reschedule_appointment(appointment_id: str, new_date: str, new_slot: s
         new_date: The new date, formatted as YYYY-MM-DD.
         new_slot: The new slot start time, formatted as HH:mm.
     """
+    phone = _caller(tool_context)
+    if not phone:
+        return _NO_CALLER
+    if not _may_change(appointment_id, tool_context):
+        return _VERIFY_FIRST
     return await asyncio.to_thread(
-        repo.reschedule_appointment, appointment_id, new_date, new_slot
+        repo.reschedule_appointment, appointment_id, new_date, new_slot, phone
     )
 
 
@@ -141,6 +268,7 @@ ALL_TOOLS = [
     check_availability,
     find_next_available,
     book_appointment,
+    verify_caller,
     list_my_appointments,
     reschedule_appointment,
     cancel_appointment,

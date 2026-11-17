@@ -14,6 +14,7 @@ _DB_MODULES = [
     "clinic_agent.runtime.followups",
     "clinic_agent.runtime.history",
     "clinic_agent.runtime.outbox",
+    "clinic_agent.tools.access_code",
     "clinic_agent.tools.catalog",
     "clinic_agent.tools.repo",
 ]

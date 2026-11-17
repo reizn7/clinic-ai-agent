@@ -48,9 +48,10 @@ from clinic_agent.config import settings
 from clinic_agent.phone import is_valid_phone, normalize_phone
 from clinic_agent.runtime import conversations, outbox
 from clinic_agent.runtime.agent import build_agent
-from clinic_agent.runtime.history import append_turn, get_history
+from clinic_agent.runtime.history import append_turn
 from clinic_agent.runtime.tool_capture import ToolCallRecorder
 from clinic_agent.runtime.turn import contextualize
+from clinic_agent.tools.booking_tools import CALLER_PHONE, CHANNEL
 from clinic_agent.voice import audio, protocol
 from clinic_agent.voice.call_trace import CallTracer
 
@@ -233,11 +234,16 @@ class CallBridge:
 
     async def _run(self) -> None:
         try:
-            history = await get_history(self.phone) if self.phone else []
+            # No prior history on voice: it holds tool results (appointment lists),
+            # and the caller has not proven they own this number yet. They do that
+            # with verify_caller; the tools read the number from session state.
             await self.runner.session_service.create_session(
-                app_name=self.runner.app_name, user_id=self.user_id, session_id=self.session_id
+                app_name=self.runner.app_name,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                state={CALLER_PHONE: self.phone, CHANNEL: "voice"},
             )
-            seeded = contextualize(GREETING_CUE, history, self.phone, channel="voice")
+            seeded = contextualize(GREETING_CUE, [], self.phone, channel="voice")
             self.queue.send_content(types.Content(role="user", parts=[types.Part(text=seeded)]))
             await self._pump()
         except Exception:

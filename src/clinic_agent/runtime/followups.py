@@ -9,14 +9,18 @@ Message wording is fixed text built from the stored fields, not model output, so
 patient can rely on it. The same values feed the optional Meta templates:
 
 * booked / rescheduled: {{1}} patient name, {{2}} doctor, {{3}} date and time,
-  {{4}} clinic, {{5}} booking reference
+  {{4}} clinic, {{5}} booking reference, {{6}} security code
+
+Booked / rescheduled confirmations carry the patient's security code
+(``tools.access_code``): the only way a phone caller can prove they own the
+number. It is created here on first use, so every confirmation has one.
 * cancelled: {{1}} patient name, {{2}} doctor, {{3}} date and time, {{4}} clinic
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,6 +30,7 @@ from clinic_agent.config import settings
 from clinic_agent.db import get_db
 from clinic_agent.integrations import google_calendar
 from clinic_agent.runtime.outbox import CALENDAR_SYNC, WHATSAPP_NOTIFY, PermanentError
+from clinic_agent.tools import access_code
 from clinic_agent.whatsapp import client as whatsapp
 
 
@@ -46,6 +51,8 @@ class Snapshot:
     clinic_name: str
     clinic_address: str
     clinic_phone: str
+    patient_id: ObjectId | None = None
+    access_code: str = ""  # filled in only for booked/rescheduled confirmations
 
     @property
     def start(self) -> datetime:
@@ -91,6 +98,7 @@ def _load_sync(appointment_id: ObjectId) -> Snapshot | None:
         clinic_name=clinic.get("clinicName", "the clinic"),
         clinic_address=clinic.get("address", ""),
         clinic_phone=clinic.get("phone", ""),
+        patient_id=patient.get("_id"),
     )
 
 
@@ -197,8 +205,14 @@ def message_text(event: str, s: Snapshot) -> str:
         f"Doctor: {doctor}\n"
         f"When: {s.when}\n"
         f"Where: {where}{contact}\n"
-        f"Booking ref: {s.reference}\n\n"
-        f"Reply here to reschedule or cancel."
+        f"Booking ref: {s.reference}\n"
+        + (
+            f"Security code: {s.access_code}\n"
+            "Keep it private. You'll need it to manage your appointments on a call.\n"
+            if s.access_code
+            else ""
+        )
+        + "\nReply here to reschedule or cancel."
     )
 
 
@@ -213,6 +227,7 @@ def template_for(event: str, s: Snapshot) -> tuple[str, list[str]] | None:
     params = [s.patient_name, s.doctor, s.when, s.clinic_name]
     if event != "cancelled":
         params.append(s.reference)
+        params.append(s.access_code)
     return name, params
 
 
@@ -226,6 +241,9 @@ async def notify_patient(job: dict) -> tuple[str, dict]:
         return "skipped", {"result": "patient has no phone"}
     if event != "cancelled" and s.status == "Cancelled":
         return "skipped", {"result": "appointment cancelled before the confirmation went out"}
+    if event != "cancelled" and s.patient_id is not None:
+        code = await asyncio.to_thread(access_code.ensure_access_code, s.patient_id)
+        s = replace(s, access_code=code or "")
 
     template = template_for(event, s)
     try:

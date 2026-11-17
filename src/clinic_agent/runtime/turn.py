@@ -25,6 +25,7 @@ from clinic_agent.runtime.tool_capture import ToolCallRecorder
 from clinic_agent.runtime.tool_capture import (  # noqa: F401  (re-exported; tests import it)
     looks_like_error as _looks_like_error,
 )
+from clinic_agent.tools.booking_tools import CALLER_PHONE, CHANNEL
 
 log = logging.getLogger("clinic_agent.runtime.turn")
 
@@ -143,8 +144,13 @@ async def _run_turn(
     # Fresh session per turn: history is carried in the prompt, not ADK state.
     session_id = uuid.uuid4().hex
     adk_user = observability.adk_user_id(phone, fallback=session_id)
+    # The caller's number lives in session state, where the tools read it; the
+    # model never supplies it (see tools.booking_tools).
     await _runner.session_service.create_session(
-        app_name=APP_NAME, user_id=adk_user, session_id=session_id
+        app_name=APP_NAME,
+        user_id=adk_user,
+        session_id=session_id,
+        state={CALLER_PHONE: phone, CHANNEL: "whatsapp"},
     )
 
     new_message = types.Content(role="user", parts=[types.Part.from_text(text=seeded)])

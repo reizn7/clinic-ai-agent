@@ -11,10 +11,12 @@ from clinic_agent.prompt import (
     compose_prompt,
 )
 
-# sha256 of SYSTEM_PROMPT as shipped before the BASE/WHATSAPP/VOICE split. The
-# WhatsApp agent's effective prompt must stay byte-for-byte identical.
-_PRE_SPLIT_SHA256 = "dfa912ccfc3e3c7fc4dcc8ac1230ed0aef07d39967eaa4b2945c87fad0dc8b6a"
-_PRE_SPLIT_LEN = 5848
+# sha256 of the shipped WhatsApp SYSTEM_PROMPT. Pinned so voice-prompt work can't
+# change it by accident; update both values only for a deliberate WhatsApp change.
+# Last deliberate change: workingDays rule, privacy/verify_caller section, tools
+# no longer take a phone argument.
+_PRE_SPLIT_SHA256 = "d21bc4c95a85f9e1ebd0866a182e11f8c5207abec32daeb4f3b5852d1d3a1a58"
+_PRE_SPLIT_LEN = 6996
 
 
 def test_whatsapp_prompt_unchanged() -> None:

@@ -25,6 +25,7 @@ import time
 from typing import Any
 
 from clinic_agent import observability
+from clinic_agent.runtime.tool_capture import safe_args
 
 log = logging.getLogger("clinic_agent.voice.call_trace")
 
@@ -96,7 +97,7 @@ class CallTracer:
             self._gen_usage = usage  # Live reports running totals for the turn
 
         for call in calls:
-            args = dict(call.args or {})
+            args = safe_args(call.name, dict(call.args or {}))
             # OpenAI-style tool call (arguments JSON-encoded) so Langfuse renders it
             # as a card; the id matches the instrumentor's tool span output.
             self._gen_tool_calls.append(

@@ -15,6 +15,14 @@ from __future__ import annotations
 import time
 from typing import Any
 
+# Tool args never stored in conversation records / transcripts / traces.
+_SECRET_ARGS = {"verify_caller": ("code",)}
+
+
+def safe_args(name: str | None, args: dict) -> dict:
+    hidden = _SECRET_ARGS.get(name or "", ())
+    return {k: ("[redacted]" if k in hidden else v) for k, v in args.items()}
+
 
 def looks_like_error(result: Any) -> bool:
     """Our tools signal failure with ``error`` or a falsy ``success``."""
@@ -40,7 +48,7 @@ class ToolCallRecorder:
         for call in event.get_function_calls() or []:
             self._pending[call.id] = {
                 "name": call.name,
-                "args": dict(call.args or {}),
+                "args": safe_args(call.name, dict(call.args or {})),
                 "t0": time.perf_counter(),
             }
         completed: list[dict] = []
