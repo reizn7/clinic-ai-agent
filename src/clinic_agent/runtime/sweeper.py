@@ -48,6 +48,10 @@ async def run_once() -> None:
                 **({} if result else {"level": "WARNING", "status_message": "no analytics"}),
             )
         await asyncio.to_thread(conversations.apply_analytics, external_id, result)
+        if result:
+            observability.score_session(
+                external_id, "sentiment", result.sentiment, data_type="CATEGORICAL"
+            )
         log.info(
             "sweeper: analytics %s for %s",
             "done" if result else "failed",

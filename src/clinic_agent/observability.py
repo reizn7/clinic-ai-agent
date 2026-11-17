@@ -195,6 +195,9 @@ class _NoopObservation:
     def end(self, **_: Any) -> _NoopObservation:
         return self
 
+    def score_trace(self, **_: Any) -> None:
+        return None
+
 
 _NOOP = _NoopObservation()
 
@@ -304,6 +307,53 @@ def start_observation(name: str, *, as_type: str, **kwargs: Any) -> Any:
     except Exception:
         log.exception("could not open observation %s", name)
         return _NOOP
+
+
+# ---- scores -----------------------------------------------------------------
+#
+# Score names are stable (dashboards and filters key on them). Session scores use
+# a deterministic id, so re-scoring a conversation (e.g. a voice call closed by
+# the sweeper and then again on hangup) overwrites instead of duplicating.
+
+
+def score_session(
+    session_id: str | None,
+    name: str,
+    value: float | str,
+    *,
+    data_type: str,
+    comment: str | None = None,
+) -> None:
+    """Attach a score to a Langfuse session (= one conversation). Never raises."""
+    if _client is None or not session_id:
+        return
+    try:
+        _client.create_score(
+            name=name,
+            value=value,
+            session_id=session_id,
+            score_id=f"{session_id}-{name}",
+            data_type=data_type,
+            comment=redact(comment) if comment else None,
+        )
+    except Exception:
+        log.exception("could not score session %s (%s)", session_id, name)
+
+
+def score_tool_errors(obs: Any, tool_calls: list[dict]) -> None:
+    """``tool_error`` (bool) on the trace ``obs`` roots; skipped if no tool ran."""
+    if not tool_calls:
+        return
+    failed = [c.get("name") for c in tool_calls if c.get("status") == "error"]
+    try:
+        obs.score_trace(
+            name="tool_error",
+            value=1 if failed else 0,
+            data_type="BOOLEAN",
+            comment=", ".join(str(n) for n in failed) or None,
+        )
+    except Exception:
+        log.exception("could not score tool_error")
 
 
 def usage_details(usage_metadata: Any) -> dict[str, int] | None:

@@ -14,9 +14,9 @@ from clinic_agent.prompt import (
 # sha256 of the shipped WhatsApp SYSTEM_PROMPT. Pinned so voice-prompt work can't
 # change it by accident; update both values only for a deliberate WhatsApp change.
 # Last deliberate change: workingDays rule, privacy/verify_caller section, tools
-# no longer take a phone argument.
-_PRE_SPLIT_SHA256 = "d21bc4c95a85f9e1ebd0866a182e11f8c5207abec32daeb4f3b5852d1d3a1a58"
-_PRE_SPLIT_LEN = 6996
+# no longer take a phone argument; handoff: already_alerted + keep helping.
+_PRE_SPLIT_SHA256 = "e75662266c9859e7f421943801934bec4b8a19be8747fd9ecce516b6a4f83c0a"
+_PRE_SPLIT_LEN = 7185
 
 
 def test_whatsapp_prompt_unchanged() -> None:

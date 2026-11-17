@@ -239,6 +239,7 @@ src/clinic_agent/
 scripts/
   seed.py                idempotent: 1 clinic + 2 doctors + all indexes
   seed_demo.py           DESTRUCTIVE: wipes data, seeds 7 doctors, sample patients + appointments
+  seed_hospital.py       insert-only: hospital-scale data (about, 14 more doctors, Staff, Services & charges, Subsidies & schemes)
   smoke_live.py          live end-to-end check (real Mongo + Gemini, no WhatsApp send)
   voice_sim.py           local call-page simulator: streams WAV / `say` audio, saves replies to out.wav
 tests/                   unit tests (pytest + mongomock, no live services)
@@ -379,7 +380,24 @@ slow or failing Google/Meta call never blocks the conversation.
   (calendar not shared, WhatsApp rejection) fail at once with a readable `lastError`.
 - Outcomes are written onto the appointment (`calendarSync`, `confirmation`) for the
   console, and each job is a Langfuse trace (`sync-doctor-calendar`,
-  `send-appointment-confirmation`).
+  `send-appointment-confirmation`, `alert-staff-handoff`).
+- `staff.alert` (not tied to an appointment) is the human handoff; see below.
+
+### `runtime/escalation.py` (human handoff)
+When `escalate_to_human` runs, `request_handoff` queues one `staff.alert` outbox job
+per recipient: every **active** row on the console's **Staff** page (`records`,
+`entityType: "staff"`) with `receivesEscalations: true` and a valid `phone`. The
+worker WhatsApps each of them the patient's name (if known), number, channel, reason
+and time; it never waits for the conversation to end. Facts:
+- Staff numbers are read only here. The Staff page isn't `agentEnabled` and its
+  fields aren't agent-visible, so the model never sees them.
+- A second request from the same patient within 30 minutes doesn't re-alert; the
+  tool returns `already_alerted: true` and the agent says the team already knows.
+- Meta only delivers free text to a number that messaged the clinic in the last 24 h.
+  For reliable alerts, approve a template and set `WHATSAPP_TEMPLATE_ESCALATION`
+  (params: patient name, patient phone, channel, reason, clinic name).
+- No recipients configured: the conversation is still flagged `escalated` for the
+  console queue, and a warning is logged.
 
 ### `tools/repo.py`
 Synchronous Mongo data access, ported from v1's Mongoose services. Key behaviours:
@@ -491,7 +509,7 @@ interface. Each tool runs the corresponding sync `repo` function via `asyncio.to
 | `reschedule_appointment` | `appointment_id, new_date, new_slot` | like `book_appointment` |
 | `cancel_appointment` | `appointment_id` | `{success, appointmentId, status}` or `{success: false, error}` |
 | `search_catalog` | `catalog, query?` | `{catalog, label, query, total_matches, results: [{name, <field label>: value…}]}` or `{error, available_catalogs}` |
-| `escalate_to_human` | `reason` | `{escalated: true, message}` (logs it; does **not** notify anyone) |
+| `escalate_to_human` | `reason` | `{escalated: true, message, staff_alerted, already_alerted}`: queues WhatsApp alerts to staff opted in on the Staff page |
 
 Formats: `date` = `YYYY-MM-DD`, `slot` = `HH:mm`, `doctor_name` without the "Dr." prefix.
 **Error convention:** a result with an `error` key or `success: false` is treated as a
@@ -535,7 +553,7 @@ The voice style (`VOICE_STYLE`) replaces the WhatsApp formatting rules:
 - A brief "one moment, let me check" before a tool call is allowed.
 - Never ask for the phone number.
 - Reply in the caller's language (English, Hindi, or Hinglish) and stay consistent.
-- After `escalate_to_human`, tell the caller the clinic will call them back.
+- After `escalate_to_human`, tell the caller the clinic team will call them back on this number.
 - End with a short goodbye.
 
 ---
@@ -632,6 +650,8 @@ Copy `.env.example` to `.env`. All settings live in
 | `VOICE_MODEL` | `gemini-3.8-live` | Gemini Live native-audio model for voice calls (must support function calling) |
 | `VOICE_NAME` | `""` | Optional prebuilt voice (e.g. `Kore`, `Puck`); empty means the model default |
 | `VOICE_WS_TOKEN` | `""` | Optional shared secret; if set, open the page as `/voice/call?token=<value>` (the page passes it to the WebSocket) |
+| `STAFF_ALERTS_ENABLED` | `true` | WhatsApp-alert opted-in staff (Staff page) when a patient asks for a human |
+| `WHATSAPP_TEMPLATE_ESCALATION` | `""` | Approved template for staff alerts outside the 24 h window; empty = plain text |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `PORT` | `3000` | HTTP port |
 
@@ -653,6 +673,7 @@ cp .env.example .env                  # fill in the values above
 uv run python scripts/seed.py         # idempotent: clinic + 2 doctors + indexes
 # or, for a richer demo dataset (WIPES this CLINIC_ID's patients/appointments/conversations/transcripts/pending_messages/clinic/doctors):
 # uv run python scripts/seed_demo.py
+uv run python scripts/seed_hospital.py  # optional, insert-only: realistic hospital data
 uv run medi-desk-ai                   # serves on :$PORT (default 3000)
 ```
 
@@ -666,6 +687,15 @@ uv run medi-desk-ai                   # serves on :$PORT (default 3000)
 - `seed_demo.py`: 7 doctors across specialties (General Physician, Dentist,
   Pediatrician, Cardiologist, Dermatologist, Orthopedic Surgeon, Gynecologist), a few
   sample patients, and existing `Confirmed` appointments on upcoming working days.
+- `seed_hospital.py`: turns the clinic into a realistic 150-bed multi-speciality
+  hospital. It fills the clinic's `about` and adds clinic fields (emergency, ambulance
+  helpline, visiting hours, beds, specialities, facilities, insurance/TPAs, payment
+  modes, follow-up policy). It adds a doctor page (degrees, experience, languages,
+  fee, about, OPD room) and 14 more doctors. It also adds three custom pages: **Staff**
+  (7 people, no phone numbers, alerts off), **Services & charges** (86 priced items
+  across consultations, lab, imaging, cardiac, packages, wards/rooms, ICU, ambulance,
+  emergency, surgery packages, dental, physiotherapy) and **Subsidies & schemes** (10).
+  It only inserts what's missing, so console edits survive a re-run.
 
 ### Connect WhatsApp (local dev)
 
@@ -823,8 +853,10 @@ Keep these true when changing the code:
 - **No ownership check on cancel/reschedule:** these tools act on any
   `appointment_id`. The agent obtains ids via `list_my_appointments(phone)`, but the
   repo does not verify that the appointment belongs to the caller.
-- **`escalate_to_human` only flags.** It logs and sets `escalated` on the conversation
-  for the console queue; no one is actively notified.
+- **Handoff is an alert, not a live takeover.** `escalate_to_human` WhatsApps opted-in
+  staff, but the bot keeps answering the WhatsApp chat; staff reply or call back
+  separately. Without `WHATSAPP_TEMPLATE_ESCALATION`, alerts only reach staff who
+  messaged the clinic number in the last 24 h.
 - **Timezone:** "today", past-date checks, and `appointmentAt` use the **server's
   local time**, with no clinic timezone configured. Deploy with the clinic's TZ or add
   one.
@@ -839,8 +871,8 @@ Keep these true when changing the code:
 - **Voice: the caller's number is self-entered and unverified.** Anyone with the page
   link can type any number and then see and manage that number's appointments. A real
   deployment needs OTP (or another proof of ownership) before the call starts.
-- **Voice: no call transfer.** `escalate_to_human` only flags the conversation; the
-  agent tells the caller the clinic will call back. Nobody is notified.
+- **Voice: no call transfer.** `escalate_to_human` alerts staff and the agent says
+  the team will call back; the call isn't transferred or ended by the server.
 - **Voice: Live session limits.** Audio-only Live sessions are capped at about 15
   minutes unless context compression is on (it is). Connections are recycled about
   every 10 minutes, and ADK reconnects with session resumption. If the live session

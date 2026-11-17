@@ -29,7 +29,8 @@ from bson import ObjectId
 from clinic_agent.config import settings
 from clinic_agent.db import get_db
 from clinic_agent.integrations import google_calendar
-from clinic_agent.runtime.outbox import CALENDAR_SYNC, WHATSAPP_NOTIFY, PermanentError
+from clinic_agent.runtime import escalation
+from clinic_agent.runtime.outbox import CALENDAR_SYNC, STAFF_ALERT, WHATSAPP_NOTIFY, PermanentError
 from clinic_agent.tools import access_code
 from clinic_agent.whatsapp import client as whatsapp
 
@@ -281,4 +282,8 @@ async def notify_patient(job: dict) -> tuple[str, dict]:
     return "done", {"result": "sent", "messageId": message_id}
 
 
-HANDLERS = {CALENDAR_SYNC: sync_calendar, WHATSAPP_NOTIFY: notify_patient}
+HANDLERS = {
+    CALENDAR_SYNC: sync_calendar,
+    WHATSAPP_NOTIFY: notify_patient,
+    STAFF_ALERT: escalation.alert_staff,
+}

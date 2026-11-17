@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from pymongo import ReturnDocument
 
+from clinic_agent import observability
 from clinic_agent.config import settings
 from clinic_agent.db import create_index_safe, get_db
 from clinic_agent.phone import to_e164
@@ -235,6 +236,48 @@ def _derived_fields(all_calls: list[dict]) -> dict[str, Any]:
     }
 
 
+# Primary intents where the patient was trying to get an appointment slot.
+_BOOKING_INTENTS = {"book_appointment", "reschedule_appointment"}
+
+
+def conversation_scores(calls: list[dict]) -> list[dict[str, Any]]:
+    """Langfuse session scores for a finished conversation (pure).
+
+    ``booking_succeeded`` is only emitted when the patient was trying to book or
+    reschedule, so its average is a booking-completion rate.
+    """
+    primary = derive_primary_intent(calls)
+    escalated = _succeeded(calls, "escalate_to_human")
+    scores: list[dict[str, Any]] = [
+        {"name": "conversation_outcome", "value": derive_outcome(calls), "data_type": "CATEGORICAL"},
+        {"name": "primary_intent", "value": primary, "data_type": "CATEGORICAL"},
+        {
+            "name": "escalated",
+            "value": 1 if escalated else 0,
+            "data_type": "BOOLEAN",
+            "comment": escalation_reason(calls) if escalated else None,
+        },
+    ]
+    if primary in _BOOKING_INTENTS:
+        booked = _succeeded(calls, "book_appointment") or _succeeded(
+            calls, "reschedule_appointment"
+        )
+        scores.append(
+            {
+                "name": "booking_succeeded",
+                "value": 1 if booked else 0,
+                "data_type": "BOOLEAN",
+                "comment": primary,
+            }
+        )
+    return scores
+
+
+def _score_conversation(external_id: str, calls: list[dict]) -> None:
+    for s in conversation_scores(calls):
+        observability.score_session(external_id, **s)
+
+
 def _patient_name(phone: str) -> str:
     doc = get_db()["patients"].find_one(
         {"clinicId": settings.CLINIC_ID, "phone": phone}, {"name": 1}
@@ -265,8 +308,9 @@ def close_idle_active(idle_cutoff_iso: str) -> int:
     closed = 0
     query = {"clinicId": settings.CLINIC_ID, "status": "active", "endedAt": {"$lt": idle_cutoff_iso}}
     for conv in col.find(query):
-        status = _final_status(_calls_from_messages(conv.get("messages", [])))
-        col.update_one({"externalId": conv["externalId"]}, {"$set": {"status": status}})
+        calls = _calls_from_messages(conv.get("messages", []))
+        col.update_one({"externalId": conv["externalId"]}, {"$set": {"status": _final_status(calls)}})
+        _score_conversation(conv["externalId"], calls)
         closed += 1
     return closed
 
@@ -395,10 +439,12 @@ def _record_turn_sync(
     conv = _latest_active_whatsapp(col, e164)
     if conv and _is_stale(conv, now):
         # Idle window elapsed → finalize the stale conversation, start fresh.
+        stale_calls = _calls_from_messages(conv.get("messages", []))
         col.update_one(
             {"externalId": conv["externalId"]},
-            {"$set": {"status": _final_status(_calls_from_messages(conv.get("messages", [])))}},
+            {"$set": {"status": _final_status(stale_calls)}},
         )
+        _score_conversation(conv["externalId"], stale_calls)
         conv = None
 
     if conv is None:
@@ -523,6 +569,7 @@ def _finish_call_sync(
             "$unset": {"analyticsStatus": "", "analyticsStartedAt": ""},
         },
     )
+    _score_conversation(external_id, all_calls)
 
 
 async def start_call(phone: str, call_id: str, started_at: datetime) -> str:

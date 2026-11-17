@@ -1,4 +1,4 @@
-"""Outbox: follow-up jobs for appointments (calendar sync, WhatsApp confirmations).
+"""Outbox: follow-up jobs (calendar sync, WhatsApp confirmations, staff handoff alerts).
 
 A booking tool writes the appointment and, in the same breath, queues jobs here.
 The worker (``run_forever``, started in the app lifespan) delivers them, so a slow
@@ -48,12 +48,14 @@ _BATCH = 20
 
 CALENDAR_SYNC = "calendar.sync"
 WHATSAPP_NOTIFY = "whatsapp.notify"
+STAFF_ALERT = "staff.alert"  # a patient asked for a human (runtime.escalation)
 
 _UNSENT = ["held", "pending"]
 # Langfuse trace names (stable, verb-first: dashboards filter on them).
 _TRACE_NAMES = {
     CALENDAR_SYNC: "sync-doctor-calendar",
     WHATSAPP_NOTIFY: "send-appointment-confirmation",
+    STAFF_ALERT: "alert-staff-handoff",
 }
 
 _hold: contextvars.ContextVar[str | None] = contextvars.ContextVar("outbox_hold", default=None)
@@ -96,13 +98,16 @@ def ensure_indexes() -> None:
     col = get_db()[COLLECTION]
     create_index_safe(col, [("clinicId", 1), ("status", 1), ("nextAttemptAt", 1)], name="due")
     create_index_safe(col, [("appointmentId", 1), ("kind", 1), ("status", 1)], name="by_appt")
+    create_index_safe(
+        col, [("clinicId", 1), ("kind", 1), ("patientPhone", 1), ("createdAt", -1)], name="by_alert"
+    )
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _job(kind: str, appointment_id: ObjectId, *, status: str, **extra: Any) -> dict:
+def _job(kind: str, appointment_id: ObjectId | None, *, status: str, **extra: Any) -> dict:
     now = _now()
     return {
         "clinicId": settings.CLINIC_ID,
@@ -170,6 +175,18 @@ def _enqueue(appointment_id: ObjectId, event: str) -> None:
             **({"hold": hold} if hold else {}),
         )
     )
+
+
+def enqueue_staff_alert(**fields: Any) -> None:
+    """Queue one staff handoff alert (never held: staff should know right away)."""
+    get_db()[COLLECTION].insert_one(_job(STAFF_ALERT, None, status="pending", **fields))
+
+
+def _subject(job: dict) -> str:
+    """What a job is about, for logs and traces."""
+    if job.get("appointmentId") is not None:
+        return str(job["appointmentId"])
+    return str(job.get("staffName") or job["_id"])
 
 
 # ---- worker -----------------------------------------------------------------------
@@ -241,22 +258,22 @@ async def process_one(handlers: dict[str, Handler]) -> bool:
     with observability.trace_root(
         _TRACE_NAMES.get(job["kind"], job["kind"]),
         channel="followup",
-        input={"appointmentId": str(job["appointmentId"]), "event": job.get("event")},
+        input={"subject": _subject(job), "event": job.get("event")},
         metadata={"attempt": job.get("attempts"), "job_id": str(job["_id"])},
     ) as obs:
         try:
             status, fields = await handler(job)
             await asyncio.to_thread(_finish_sync, job, status, **fields)
             obs.update(output={"status": status, **{k: str(v) for k, v in fields.items()}})
-            log.info("outbox %s %s → %s", job["kind"], job["appointmentId"], status)
+            log.info("outbox %s %s → %s", job["kind"], _subject(job), status)
         except PermanentError as exc:
             await asyncio.to_thread(_finish_sync, job, "failed", lastError=str(exc))
             obs.update(level="ERROR", status_message=str(exc)[:300])
-            log.error("outbox %s %s failed: %s", job["kind"], job["appointmentId"], exc)
+            log.error("outbox %s %s failed: %s", job["kind"], _subject(job), exc)
         except Exception as exc:
             outcome = await asyncio.to_thread(_retry_sync, job, repr(exc))
             obs.update(level="WARNING", status_message=f"{outcome}: {exc!r}"[:300])
-            log.warning("outbox %s %s %s: %r", job["kind"], job["appointmentId"], outcome, exc)
+            log.warning("outbox %s %s %s: %r", job["kind"], _subject(job), outcome, exc)
     return True
 
 

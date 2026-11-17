@@ -231,6 +231,7 @@ class CallBridge:
             if self.end_reason == protocol.END_ERROR:
                 update |= {"level": "ERROR", "status_message": f"call ended: {self.end_reason}"}
             obs.update(**update)
+            observability.score_tool_errors(obs, self.recorder.calls)
 
     async def _run(self) -> None:
         try:

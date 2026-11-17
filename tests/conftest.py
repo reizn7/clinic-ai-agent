@@ -11,6 +11,7 @@ _DB_MODULES = [
     "clinic_agent.db",
     "clinic_agent.runtime.conversations",
     "clinic_agent.runtime.debounce",
+    "clinic_agent.runtime.escalation",
     "clinic_agent.runtime.followups",
     "clinic_agent.runtime.history",
     "clinic_agent.runtime.outbox",

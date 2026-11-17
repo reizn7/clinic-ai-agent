@@ -24,6 +24,7 @@ import logging
 
 from google.adk.tools import ToolContext
 
+from clinic_agent.runtime import escalation
 from clinic_agent.tools import access_code, repo
 from clinic_agent.tools import catalog as catalog_data
 
@@ -246,20 +247,30 @@ async def search_catalog(catalog: str, query: str = "") -> dict:
     return await asyncio.to_thread(catalog_data.search_catalog, catalog, query)
 
 
-async def escalate_to_human(reason: str) -> dict:
+async def escalate_to_human(reason: str, tool_context: ToolContext) -> dict:
     """Hand off to the clinic's human team when the patient asks for a human or
-    has an urgent/clinical concern the agent cannot handle.
+    has a request outside your scope (billing disputes, medical questions,
+    complaints). Staff are alerted on WhatsApp with the patient's number.
 
     Args:
         reason: A short description of why a human is needed.
     """
     log.info("Escalation requested: %s", reason)
-    return {
-        "escalated": True,
-        "message": (
-            "I've let our clinic team know — someone will follow up with you here shortly."
-        ),
-    }
+    phone = _caller(tool_context)
+    channel = str(tool_context.state.get(CHANNEL) or "whatsapp")
+    try:
+        handoff = await asyncio.to_thread(escalation.request_handoff, phone, channel, reason)
+    except Exception:
+        # The conversation is still flagged for the console queue; never fail the turn.
+        log.exception("could not queue staff alert for a handoff")
+        handoff = {"staff_alerted": 0, "already_alerted": False}
+    if channel == "voice":
+        message = (
+            "I've let our clinic team know. Someone will call you back on this number shortly."
+        )
+    else:
+        message = "I've let our clinic team know. Someone will reply to you here shortly."
+    return {"escalated": True, "message": message, **handoff}
 
 
 ALL_TOOLS = [

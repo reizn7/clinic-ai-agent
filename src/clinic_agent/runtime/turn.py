@@ -131,6 +131,7 @@ async def run_turn(phone: str, message: str, *, bubbles: int = 1) -> str:
         if failed:
             update |= {"level": "ERROR", "status_message": "turn failed; fallback reply sent"}
         obs.update(**update)
+        observability.score_tool_errors(obs, tool_calls)
         return reply
 
 

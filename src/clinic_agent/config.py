@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     WHATSAPP_TEMPLATE_LANGUAGE: str = "en"
     OUTBOX_TICK_SECONDS: float = 2.0
 
+    # --- Human handoff (escalate_to_human) ---
+    # WhatsApp-alert the staff marked "Receives handoff alerts" on the console's
+    # Staff page when a patient asks for a person.
+    STAFF_ALERTS_ENABLED: bool = True
+    # Approved template for alerts outside the 24h window; empty = plain text.
+    # Body params: {{1}} patient name, {{2}} patient phone, {{3}} channel,
+    # {{4}} reason, {{5}} clinic name.
+    WHATSAPP_TEMPLATE_ESCALATION: str = ""
+
     # --- Tracing (Langfuse, OpenTelemetry-based) ---
     # Off unless enabled AND both keys are set; the app never needs Langfuse to run.
     LANGFUSE_ENABLED: bool = False
