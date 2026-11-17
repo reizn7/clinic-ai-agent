@@ -1,3 +1,13 @@
+---
+title: Medi Desk AI
+emoji: 🩺
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 3000
+pinned: false
+---
+
 # Medi Desk AI: agent
 
 **Medi Desk AI** is a **WhatsApp and browser voice-call AI receptionist for medical clinics.** This repo is the agent; the staff console lives in `receptionist-agent-platform`. Patients
@@ -805,7 +815,7 @@ analytics.
 ## Deployment
 
 A single container ([`Dockerfile`](Dockerfile), `ghcr.io/astral-sh/uv:python3.14-bookworm-slim`,
-`uv sync --frozen --no-dev`, `CMD uv run --no-dev medi-desk-ai`):
+`uv sync --frozen --no-dev`, `CMD /app/.venv/bin/medi-desk-ai`):
 
 ```bash
 docker build -t medi-desk-ai .
@@ -814,6 +824,24 @@ docker run --env-file .env -p 3000:3000 medi-desk-ai
 
 Host it anywhere with HTTPS (Render, Railway, Fly.io) and point the Meta webhook at
 `https://<host>/webhook`. Use an **always-on single instance**. See the limitations below.
+
+### Hugging Face Spaces (free, no card)
+
+The YAML block at the top of this README is the Space config (`sdk: docker`,
+`app_port: 3000`); Hugging Face reads it, GitHub ignores it.
+
+1. Create a Space: SDK **Docker**, hardware **CPU basic**, visibility **Public**
+   (Meta's webhook can't authenticate to a private Space).
+2. **Settings → Variables and secrets:** add every value from `.env.example` you use
+   as a secret, plus `TZ=Asia/Kolkata` (the container clock is UTC otherwise).
+   Use `GOOGLE_SERVICE_ACCOUNT_JSON`, not the file variant.
+3. Push: `git remote add space https://huggingface.co/spaces/<user>/<space>` then
+   `git push space main` (password = an HF access token with write scope).
+4. Seed Atlas from your machine (`scripts/seed.py`), set the Meta webhook to
+   `https://<user>-<space>.hf.space/webhook`, and open the call page at
+   `https://<user>-<space>.hf.space/voice/call?token=<VOICE_WS_TOKEN>`.
+
+Free Spaces sleep after ~48 h without traffic; open the URL before a demo to wake it.
 
 ---
 

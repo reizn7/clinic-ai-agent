@@ -20,4 +20,7 @@ COPY scripts ./scripts
 ENV PORT=3000
 EXPOSE 3000
 
-CMD ["uv", "run", "--no-dev", "medi-desk-ai"]
+# Run the venv entrypoint directly rather than `uv run`: hosts like Hugging Face
+# Spaces run the container as a non-root user (uid 1000), and `uv run` may try
+# to write to the root-owned /app/.venv or a cache dir.
+CMD ["/app/.venv/bin/medi-desk-ai"]
