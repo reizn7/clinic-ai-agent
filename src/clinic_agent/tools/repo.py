@@ -2,17 +2,26 @@
 
 Collections: clinic, doctors, patients, appointments. The booking tools call these
 via ``asyncio.to_thread``. Ported from v1's Mongoose models/services.
+
+Every query is scoped to this deployment's clinic (``settings.CLINIC_ID``) and every
+insert stamps it — the console writes doctors/clinic info for many clinics into the
+same database (see the clinic data contract). Clinic-configured extra fields live
+in each document's ``attributes``; only agent-visible ones are returned
+(``catalog.render_attributes``). Patient attributes are never read.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime, timedelta
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo.errors import DuplicateKeyError
 
+from clinic_agent.config import settings
 from clinic_agent.db import create_index_safe, get_db
+from clinic_agent.tools import catalog
 from clinic_agent.tools.slots import available_slots, generate_slots
 
 WEEKDAYS = [
@@ -47,7 +56,25 @@ def ensure_indexes() -> None:
         partialFilterExpression={"status": {"$in": ACTIVE_STATUSES}},
         name="uniq_active_slot",
     )
-    create_index_safe(get_db()["patients"], "phone", unique=True, name="uniq_phone")
+    # One patient per phone PER CLINIC (replaces the legacy unique {phone}, which
+    # scripts/migrate_clinic_scope.py drops).
+    create_index_safe(
+        get_db()["patients"],
+        [("clinicId", 1), ("phone", 1)],
+        unique=True,
+        name="uniq_clinic_phone",
+    )
+    create_index_safe(
+        get_db()["doctors"], [("clinicId", 1), ("isActive", 1), ("name", 1)],
+        name="clinic_active_name",
+    )
+    create_index_safe(get_db()["clinic"], "clinicId", unique=True, name="uniq_clinic")
+    catalog.ensure_indexes()
+
+
+def _scoped(query: dict | None = None) -> dict:
+    """``query`` restricted to this deployment's clinic."""
+    return {**(query or {}), "clinicId": settings.CLINIC_ID}
 
 
 def _weekday_name(date_key: str) -> str:
@@ -61,30 +88,49 @@ def _today_key() -> str:
 
 
 def get_clinic() -> dict:
-    doc = get_db()["clinic"].find_one() or DEFAULT_CLINIC
-    return {
+    doc = get_db()["clinic"].find_one(_scoped()) or DEFAULT_CLINIC
+    info = {
         "clinicName": doc.get("clinicName", ""),
         "timings": doc.get("timings", ""),
         "address": doc.get("address", ""),
         "phone": doc.get("phone", ""),
     }
+    details = catalog.render_attributes(
+        catalog.get_definitions().get("clinic"), doc.get("attributes"), where="clinic"
+    )
+    if details:
+        info["details"] = details
+    return info
 
 
 def list_active_doctors() -> list[dict]:
-    docs = get_db()["doctors"].find({"isActive": True}).sort("name", 1)
-    return [
-        {
+    definition = catalog.get_definitions().get("doctor")
+    docs = get_db()["doctors"].find(_scoped({"isActive": True})).sort("name", 1)
+    out = []
+    for d in docs:
+        doctor = {
             "id": str(d["_id"]),
             "name": d["name"],
             "specialization": d.get("specialization", ""),
         }
-        for d in docs
-    ]
+        details = catalog.render_attributes(
+            definition, d.get("attributes"), where=f"doctor:{d['_id']}"
+        )
+        if details:
+            doctor["details"] = details
+        out.append(doctor)
+    return out
+
+
+_DR_PREFIX = re.compile(r"^\s*(dr\.?|doctor)\s+", re.IGNORECASE)
 
 
 def _find_doctor_by_name(name: str) -> dict | None:
+    bare = _DR_PREFIX.sub("", name or "").strip()
+    if not bare:
+        return None
     return get_db()["doctors"].find_one(
-        {"name": {"$regex": f"^{name}$", "$options": "i"}, "isActive": True}
+        _scoped({"name": {"$regex": f"^{re.escape(bare)}$", "$options": "i"}, "isActive": True})
     )
 
 
@@ -117,7 +163,9 @@ def get_available_slots(doctor_name: str, date_key: str) -> dict:
     booked = [
         a["slot"]
         for a in get_db()["appointments"].find(
-            {"doctorId": doctor["_id"], "date": date_key, "status": {"$in": ACTIVE_STATUSES}},
+            _scoped(
+                {"doctorId": doctor["_id"], "date": date_key, "status": {"$in": ACTIVE_STATUSES}}
+            ),
             {"slot": 1},
         )
     ]
@@ -159,10 +207,14 @@ def get_upcoming_availability(doctor_name: str, count: int = 3) -> dict:
 def _upsert_patient(phone: str, name: str, age: int, gender: str) -> ObjectId:
     now = datetime.now(UTC)
     res = get_db()["patients"].find_one_and_update(
-        {"phone": phone},
+        _scoped({"phone": phone}),
         {
             "$set": {"name": name, "age": age, "gender": gender, "updatedAt": now},
-            "$setOnInsert": {"phone": phone, "createdAt": now},
+            "$setOnInsert": {
+                "phone": phone,
+                "clinicId": settings.CLINIC_ID,
+                "createdAt": now,
+            },
         },
         upsert=True,
         return_document=True,
@@ -192,6 +244,7 @@ def create_appointment(
     try:
         res = get_db()["appointments"].insert_one(
             {
+                "clinicId": settings.CLINIC_ID,
                 "patientId": patient_id,
                 "doctorId": doctor["_id"],
                 "date": date_key,
@@ -219,13 +272,13 @@ def create_appointment(
 
 
 def list_patient_appointments(phone: str) -> list[dict]:
-    patient = get_db()["patients"].find_one({"phone": phone})
+    patient = get_db()["patients"].find_one(_scoped({"phone": phone}))
     if not patient:
         return []
-    doctors = {d["_id"]: d["name"] for d in get_db()["doctors"].find({}, {"name": 1})}
+    doctors = {d["_id"]: d["name"] for d in get_db()["doctors"].find(_scoped(), {"name": 1})}
     appts = (
         get_db()["appointments"]
-        .find({"patientId": patient["_id"], "status": {"$in": ACTIVE_STATUSES}})
+        .find(_scoped({"patientId": patient["_id"], "status": {"$in": ACTIVE_STATUSES}}))
         .sort([("date", 1), ("slot", 1)])
     )
     return [
@@ -247,7 +300,7 @@ def cancel_appointment(appointment_id: str) -> dict:
         return {"success": False, "error": "Invalid appointment id."}
     now = datetime.now(UTC)
     res = get_db()["appointments"].update_one(
-        {"_id": oid},
+        _scoped({"_id": oid}),
         {"$set": {"status": "Cancelled", "cancelledAt": now, "updatedAt": now}},
     )
     if res.matched_count == 0:
@@ -262,10 +315,10 @@ def reschedule_appointment(appointment_id: str, new_date: str, new_slot: str) ->
     except (InvalidId, TypeError):
         return {"success": False, "error": "Invalid appointment id."}
 
-    appt = get_db()["appointments"].find_one({"_id": oid})
+    appt = get_db()["appointments"].find_one(_scoped({"_id": oid}))
     if not appt or appt["status"] == "Cancelled":
         return {"success": False, "error": "Appointment not found."}
-    doctor = get_db()["doctors"].find_one({"_id": appt["doctorId"]})
+    doctor = get_db()["doctors"].find_one(_scoped({"_id": appt["doctorId"]}))
     if not doctor:
         return {"success": False, "error": "That doctor is no longer available."}
 
@@ -280,7 +333,7 @@ def reschedule_appointment(appointment_id: str, new_date: str, new_slot: str) ->
 
     try:
         get_db()["appointments"].update_one(
-            {"_id": oid},
+            _scoped({"_id": oid}),
             {"$set": {"date": new_date, "slot": new_slot, "updatedAt": datetime.now(UTC)}},
         )
     except DuplicateKeyError:

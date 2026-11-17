@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
+from clinic_agent.config import settings
 from clinic_agent.db import get_db
 
 # Cap how many prior messages we replay, to bound prompt tokens.
@@ -22,8 +23,14 @@ MAX_HISTORY_MESSAGES = 20
 _COLLECTION = "transcripts"
 
 
+def _key(phone: str) -> dict:
+    """One history per (clinic, phone): a patient of two clinics sharing this
+    database must never see the other clinic's conversation replayed."""
+    return {"clinicId": settings.CLINIC_ID, "phone": phone}
+
+
 def _get_history_sync(phone: str) -> list[dict]:
-    doc = get_db()[_COLLECTION].find_one({"phone": phone}, {"messages": 1})
+    doc = get_db()[_COLLECTION].find_one(_key(phone), {"messages": 1})
     messages = (doc or {}).get("messages", [])
     return messages[-MAX_HISTORY_MESSAGES:]
 
@@ -43,7 +50,7 @@ def _append_turn_sync(
             {"name": c.get("name"), "result": c.get("result")} for c in tool_calls
         ]
     get_db()[_COLLECTION].update_one(
-        {"phone": phone},
+        _key(phone),
         {
             "$push": {
                 "messages": {
@@ -54,7 +61,7 @@ def _append_turn_sync(
                 }
             },
             "$set": {"updatedAt": now},
-            "$setOnInsert": {"phone": phone, "createdAt": now},
+            "$setOnInsert": {"phone": phone, "clinicId": settings.CLINIC_ID, "createdAt": now},
         },
         upsert=True,
     )

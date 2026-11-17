@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from clinic_agent.tools import catalog as catalog_data
 from clinic_agent.tools import repo
 
 log = logging.getLogger("clinic_agent.tools")
@@ -104,6 +105,20 @@ async def reschedule_appointment(appointment_id: str, new_date: str, new_slot: s
     )
 
 
+async def search_catalog(catalog: str, query: str = "") -> dict:
+    """Search one of the clinic's catalogs (e.g. lab tests, services, health
+    packages) listed under "Clinic catalogs" in your instructions. Returns the
+    matching items with their details (price, preparation, timings, …). Answer
+    only from what this returns.
+
+    Args:
+        catalog: The catalog name exactly as listed (e.g. "lab_test").
+        query: A few words to match (e.g. "thyroid" or "blood sugar fasting");
+            empty to list the first few items.
+    """
+    return await asyncio.to_thread(catalog_data.search_catalog, catalog, query)
+
+
 async def escalate_to_human(reason: str) -> dict:
     """Hand off to the clinic's human team when the patient asks for a human or
     has an urgent/clinical concern the agent cannot handle.
@@ -129,5 +144,6 @@ ALL_TOOLS = [
     list_my_appointments,
     reschedule_appointment,
     cancel_appointment,
+    search_catalog,
     escalate_to_human,
 ]

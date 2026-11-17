@@ -59,3 +59,16 @@ def test_requeue_prepends_for_retry(db):
     debounce._requeue_sync("919", ["failed1", "failed2"], t0)
     doc = db[debounce.COLLECTION].find_one({"phone": "919"})
     assert doc["messages"] == ["failed1", "failed2", "new msg"]
+
+
+def test_buffers_are_per_clinic(db, monkeypatch):
+    """Two clinics sharing the DB: each flusher only claims its own clinic's buffers."""
+    from clinic_agent.config import settings
+
+    now = datetime.now(UTC)
+    debounce._enqueue_sync("919", "hi clinic A", now - timedelta(minutes=5))
+    monkeypatch.setattr(settings, "CLINIC_ID", "clinic-b")
+    debounce._enqueue_sync("919", "hi clinic B", now - timedelta(minutes=5))
+
+    assert debounce._claim_due_sync(now) == [("919", ["hi clinic B"])]
+    assert db["pending_messages"].count_documents({}) == 1  # clinic A's still waiting

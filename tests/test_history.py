@@ -50,3 +50,14 @@ def test_history_capped(db, monkeypatch):
     hist = history._get_history_sync("919")
     assert len(hist) == 4  # last 2 turns
     assert hist[0]["content"] == "u3"
+
+
+def test_history_is_per_clinic(db, monkeypatch):
+    """A patient of two clinics never gets the other clinic's chat replayed."""
+    from clinic_agent.config import settings
+
+    history._append_turn_sync("919", "book with clinic A", "done")
+    monkeypatch.setattr(settings, "CLINIC_ID", "clinic-b")
+    assert history._get_history_sync("919") == []
+    history._append_turn_sync("919", "hello B", "hi")
+    assert [m["content"] for m in history._get_history_sync("919")] == ["hello B", "hi"]

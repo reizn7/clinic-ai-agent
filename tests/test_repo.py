@@ -4,7 +4,10 @@ import mongomock
 import pytest
 from bson import ObjectId
 
-from clinic_agent.tools import repo
+from clinic_agent.config import settings
+from clinic_agent.tools import catalog, repo
+
+CLINIC = settings.CLINIC_ID
 
 
 @pytest.fixture
@@ -12,9 +15,12 @@ def db(monkeypatch):
     client = mongomock.MongoClient()
     fake = client["clinic-test"]
     monkeypatch.setattr(repo, "get_db", lambda: fake)
+    monkeypatch.setattr(catalog, "get_db", lambda: fake)
+    catalog.clear_cache()
     # One active doctor: works Mon-Fri 09:00-11:00, 30-min slots.
     fake["doctors"].insert_one(
         {
+            "clinicId": CLINIC,
             "name": "Asha Mehta",
             "specialization": "General Physician",
             "consultationDuration": 30,
@@ -105,6 +111,24 @@ def test_booking_writes_patient_and_appointment_timestamps(db):
 
     appt = db["appointments"].find_one({"_id": ObjectId(booked["appointmentId"])})
     assert "createdAt" in appt and "updatedAt" in appt
+
+
+def test_booking_and_lookups_are_clinic_scoped(db):
+    booked = repo.create_appointment(
+        "919999999999", "Ravi", 30, "Male", "Asha Mehta", MON, "09:30"
+    )
+    assert db["patients"].find_one({"phone": "919999999999"})["clinicId"] == CLINIC
+    appt = db["appointments"].find_one({"_id": ObjectId(booked["appointmentId"])})
+    assert appt["clinicId"] == CLINIC
+
+    # Another clinic's appointment can't be listed, cancelled or rescheduled here.
+    other = db["appointments"].insert_one(
+        {"clinicId": "other-clinic", "patientId": appt["patientId"], "doctorId": appt["doctorId"],
+         "date": MON, "slot": "10:00", "status": "Pending"}
+    ).inserted_id
+    assert [a["slot"] for a in repo.list_patient_appointments("919999999999")] == ["09:30"]
+    assert repo.cancel_appointment(str(other))["success"] is False
+    assert repo.reschedule_appointment(str(other), MON, "10:30")["success"] is False
 
 
 def test_cancel_stamps_cancelled_at(db):

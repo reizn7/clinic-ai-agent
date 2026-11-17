@@ -217,7 +217,9 @@ def _derived_fields(all_calls: list[dict]) -> dict[str, Any]:
 
 
 def _patient_name(phone: str) -> str:
-    doc = get_db()["patients"].find_one({"phone": phone}, {"name": 1})
+    doc = get_db()["patients"].find_one(
+        {"clinicId": settings.CLINIC_ID, "phone": phone}, {"name": 1}
+    )
     return (doc or {}).get("name") or "Unknown"
 
 
@@ -242,7 +244,8 @@ def close_idle_active(idle_cutoff_iso: str) -> int:
     """
     col = get_db()[COLLECTION]
     closed = 0
-    for conv in col.find({"status": "active", "endedAt": {"$lt": idle_cutoff_iso}}):
+    query = {"clinicId": settings.CLINIC_ID, "status": "active", "endedAt": {"$lt": idle_cutoff_iso}}
+    for conv in col.find(query):
         status = _final_status(_calls_from_messages(conv.get("messages", [])))
         col.update_one({"externalId": conv["externalId"]}, {"$set": {"status": status}})
         closed += 1
@@ -259,6 +262,7 @@ def claim_analytics_batch(stuck_cutoff_iso: str, limit: int) -> list[tuple[str, 
     col = get_db()[COLLECTION]
     now = datetime.now(UTC).isoformat()
     query = {
+        "clinicId": settings.CLINIC_ID,
         "status": {"$ne": "active"},
         "$or": [
             {"analyticsStatus": {"$exists": False}},
@@ -324,7 +328,12 @@ def _is_stale(conv: dict, now: datetime) -> bool:
 def _latest_active_whatsapp(col: Any, e164: str) -> dict | None:
     # Voice calls are their own conversations; never append WhatsApp turns to one.
     return col.find_one(
-        {"phone": e164, "status": "active", "channel": {"$ne": VOICE_CHANNEL}},
+        {
+            "clinicId": settings.CLINIC_ID,
+            "phone": e164,
+            "status": "active",
+            "channel": {"$ne": VOICE_CHANNEL},
+        },
         sort=[("startedAt", -1)],
     )
 

@@ -56,14 +56,28 @@ def test_voice_prompt_style() -> None:
     assert '"- " bullets' not in p
 
 
-def test_build_agent_channels() -> None:
+async def test_build_agent_channels(monkeypatch) -> None:
     from clinic_agent.config import settings
     from clinic_agent.runtime.agent import build_agent
+    from clinic_agent.tools import catalog
 
+    # No catalogs configured → each channel's prompt is exactly its static prompt.
+    monkeypatch.setattr(catalog, "prompt_section", lambda: "")
     wa = build_agent()
     assert wa.model == settings.MODEL
-    assert wa.instruction == SYSTEM_PROMPT
+    assert await wa.instruction(None) == SYSTEM_PROMPT
     voice = build_agent("voice")
     assert voice.model == settings.VOICE_MODEL
-    assert voice.instruction == VOICE_SYSTEM_PROMPT
+    assert await voice.instruction(None) == VOICE_SYSTEM_PROMPT
+
+    # A clinic's catalogs are appended at run time, after the pinned prompt.
+    monkeypatch.setattr(catalog, "prompt_section", lambda: "# Clinic catalogs\n- lab_test")
+    assert await wa.instruction(None) == SYSTEM_PROMPT + "\n\n# Clinic catalogs\n- lab_test"
+
+    # A DB failure falls back to the plain prompt instead of failing the turn.
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(catalog, "prompt_section", boom)
+    assert await voice.instruction(None) == VOICE_SYSTEM_PROMPT
     assert [t.__name__ for t in wa.tools] == [t.__name__ for t in voice.tools]

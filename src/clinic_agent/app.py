@@ -20,7 +20,20 @@ from clinic_agent.whatsapp.webhook import router as webhook_router  # noqa: E402
 
 
 @contextlib.asynccontextmanager
+def _ensure_indexes() -> None:
+    """Clinic-scoped indexes (idempotent). Never blocks startup: log and carry on."""
+    from clinic_agent.runtime import conversations, debounce
+    from clinic_agent.tools import repo
+
+    for ensure in (repo.ensure_indexes, conversations.ensure_indexes, debounce.ensure_indexes):
+        try:
+            ensure()
+        except Exception:
+            logging.getLogger("clinic_agent.app").exception("index setup failed: %s", ensure)
+
+
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    await asyncio.to_thread(_ensure_indexes)
     # Background loops: idle sweeper (finalize + analytics) and debounce flusher.
     tasks = [
         asyncio.create_task(sweeper.run_forever()),

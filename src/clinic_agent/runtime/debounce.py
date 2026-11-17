@@ -30,18 +30,26 @@ COLLECTION = "pending_messages"
 
 def ensure_indexes() -> None:
     col = get_db()[COLLECTION]
-    create_index_safe(col, "phone", unique=True, name="uniq_pending_phone")
+    # One buffer per (clinic, phone): each clinic's flusher drains only its own.
+    # Replaces the legacy unique {phone} (dropped by scripts/migrate_clinic_scope.py).
+    create_index_safe(
+        col, [("clinicId", 1), ("phone", 1)], unique=True, name="uniq_pending_clinic_phone"
+    )
     create_index_safe(col, "deadline", name="pending_deadline")
 
 
 def _enqueue_sync(phone: str, text: str, now: datetime) -> None:
     deadline = (now + timedelta(seconds=settings.DEBOUNCE_WINDOW_SECONDS)).isoformat()
     get_db()[COLLECTION].update_one(
-        {"phone": phone},
+        {"clinicId": settings.CLINIC_ID, "phone": phone},
         {
             "$push": {"messages": text},
             "$set": {"deadline": deadline},
-            "$setOnInsert": {"phone": phone, "firstAt": now.isoformat()},
+            "$setOnInsert": {
+                "clinicId": settings.CLINIC_ID,
+                "phone": phone,
+                "firstAt": now.isoformat(),
+            },
         },
         upsert=True,
     )
@@ -51,7 +59,10 @@ def _claim_due_sync(now: datetime) -> list[tuple[str, list[str]]]:
     col = get_db()[COLLECTION]
     now_iso = now.isoformat()
     cap_cutoff = (now - timedelta(seconds=settings.DEBOUNCE_MAX_WAIT_SECONDS)).isoformat()
-    query = {"$or": [{"deadline": {"$lte": now_iso}}, {"firstAt": {"$lte": cap_cutoff}}]}
+    query = {
+        "clinicId": settings.CLINIC_ID,
+        "$or": [{"deadline": {"$lte": now_iso}}, {"firstAt": {"$lte": cap_cutoff}}],
+    }
 
     out: list[tuple[str, list[str]]] = []
     while True:
@@ -67,11 +78,15 @@ def _claim_due_sync(now: datetime) -> list[tuple[str, list[str]]]:
 def _requeue_sync(phone: str, messages: list[str], now: datetime) -> None:
     deadline = (now + timedelta(seconds=settings.DEBOUNCE_WINDOW_SECONDS)).isoformat()
     get_db()[COLLECTION].update_one(
-        {"phone": phone},
+        {"clinicId": settings.CLINIC_ID, "phone": phone},
         {
             "$push": {"messages": {"$each": messages, "$position": 0}},
             "$set": {"deadline": deadline},
-            "$setOnInsert": {"phone": phone, "firstAt": now.isoformat()},
+            "$setOnInsert": {
+                "clinicId": settings.CLINIC_ID,
+                "phone": phone,
+                "firstAt": now.isoformat(),
+            },
         },
         upsert=True,
     )

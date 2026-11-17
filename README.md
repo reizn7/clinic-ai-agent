@@ -361,7 +361,12 @@ of 10 and applies analytics. `run_forever()` survives tick failures.
 
 ### `tools/repo.py`
 Synchronous Mongo data access, ported from v1's Mongoose services. Key behaviours:
-- Doctors are matched by **case-insensitive exact name** among `isActive: true` doctors.
+- **Every query is scoped to `CLINIC_ID`** and every insert stamps it: several clinics
+  can share one database (the console writes their data, see below).
+- Doctors are matched by **case-insensitive exact name** among `isActive: true` doctors,
+  with a leading "Dr."/"Doctor" stripped and the name regex-escaped.
+- `get_clinic()` / `list_active_doctors()` add a `details` object with the clinic's
+  configured, agent-visible extra fields (via `tools/catalog.py`).
 - `get_available_slots()` rejects past dates and days not in `availableDays`, tiles
   `workingHours` by `consultationDuration`, and removes slots booked with an active status.
 - `get_upcoming_availability()` returns the next 3 dates (starting tomorrow, up to 60
@@ -370,7 +375,22 @@ Synchronous Mongo data access, ported from v1's Mongoose services. Key behaviour
   inserts with status `Pending`. A `DuplicateKeyError` returns `{success: false, conflict: true}`.
 - `reschedule_appointment()` keeps the doctor and status and only changes date/slot.
 - `cancel_appointment()` sets status `Cancelled` + `cancelledAt`.
-- `ensure_indexes()` creates the double-booking guard and the unique patient phone index.
+- `ensure_indexes()` creates the double-booking guard, the unique `(clinicId, phone)`
+  patient index and the clinic/doctor/catalog indexes.
+
+### `tools/catalog.py`
+The agent (reader) side of the console's **clinic data contract**
+([`receptionist-agent-platform/docs/clinic-data-contract.md`](../receptionist-agent-platform/docs/clinic-data-contract.md)).
+Each clinic defines its own pages and fields in the console (`entity_definitions`):
+extra fields on the system pages (`clinic`, `doctor`, `patient`, stored in each
+document's `attributes`) and custom pages such as lab tests or services (stored in
+`records`).
+- Definitions are cached for 60 s, so console edits reach patients within a minute.
+- The agent sees a field only if it is `agentVisible`, not `pii` and not `archived`.
+  Values are rendered as `{label: value}`; a value that doesn't match its field type
+  is dropped and logged, never allowed to fail a turn. Patient attributes are never read.
+- `search_catalog()` text-searches one `agentEnabled` custom page (active rows, max 10).
+- `prompt_section()` lists those catalogs for the system prompt.
 
 ### `tools/slots.py`
 `generate_slots({"start":"09:00","end":"13:00"}, 30)` returns `["09:00","09:30",…,"12:30"]`.
@@ -440,14 +460,15 @@ interface. Each tool runs the corresponding sync `repo` function via `asyncio.to
 
 | Tool | Args | Returns (shape) |
 |---|---|---|
-| `get_clinic_info` | – | `{clinicName, timings, address, phone}` |
-| `list_doctors` | – | `{doctors: [{id, name, specialization}]}` |
+| `get_clinic_info` | – | `{clinicName, timings, address, phone, details?}` |
+| `list_doctors` | – | `{doctors: [{id, name, specialization, details?}]}` (`details` = the clinic's agent-visible extra fields, e.g. degrees, experience) |
 | `check_availability` | `doctor_name, date` | `{doctor, date, weekday, slots[], note?}` or `{error}` |
 | `find_next_available` | `doctor_name` | `{doctor, dates: [{date, weekday, slots[]}]}` or `{error}` |
 | `book_appointment` | `patient_name, age, gender, doctor_name, date, slot, phone` | `{success: true, appointmentId, doctor, date, weekday, slot, status}` or `{success: false, error, conflict?, available_slots?}` |
 | `list_my_appointments` | `phone` | `{appointments: [{appointmentId, doctor, date, slot, status}]}` |
 | `reschedule_appointment` | `appointment_id, new_date, new_slot` | like `book_appointment` |
 | `cancel_appointment` | `appointment_id` | `{success, appointmentId, status}` or `{success: false, error}` |
+| `search_catalog` | `catalog, query?` | `{catalog, label, query, total_matches, results: [{name, <field label>: value…}]}` or `{error, available_catalogs}` |
 | `escalate_to_human` | `reason` | `{escalated: true, message}` (logs it; does **not** notify anyone) |
 
 Formats: `date` = `YYYY-MM-DD`, `slot` = `HH:mm`, `doctor_name` without the "Dr." prefix.
@@ -499,23 +520,35 @@ The voice style (`VOICE_STYLE`) replaces the WhatsApp formatting rules:
 
 ## Data model (MongoDB)
 
-Database name comes from `MONGO_DB_NAME` (default `clinic-ai-agent`).
+Database name comes from `MONGO_DB_NAME` (default `clinic-ai-agent`). The staff
+console (`receptionist-agent-platform`) uses the **same database**: it reads
+`conversations` and writes the clinic-configured data below. **Every collection
+except `conversations`' `externalId` lookups is scoped by `clinicId`** (= `CLINIC_ID`),
+so one database can hold several clinics.
 
 | Collection | Shape | Indexes |
 |---|---|---|
-| `clinic` | `{clinicName, timings, address, phone, slotDuration}` (single doc; `get_clinic` falls back to defaults if missing) | – |
-| `doctors` | `{name, specialization, consultationDuration (min), availableDays: ["Monday",…], workingHours: {start, end}, isActive}` | – |
-| `patients` | `{phone, name, age, gender, createdAt, updatedAt}`. `phone` is the raw WhatsApp `from` (digits, no `+`) | unique `phone` |
+| `clinic` | `{clinicId, clinicName, timings, address, phone, slotDuration, attributes}` (one doc per clinic; `get_clinic` falls back to defaults if missing) | unique `clinicId` |
+| `doctors` | `{clinicId, name, specialization, consultationDuration (min), availableDays: ["Monday",…], workingHours: {start, end}, isActive, attributes}` | `(clinicId, isActive, name)` |
+| `patients` | `{clinicId, phone, name, age, gender, createdAt, updatedAt, attributes}`. `phone` is the raw WhatsApp `from` (digits, no `+`); `attributes` are staff-only | unique `(clinicId, phone)` |
+| `entity_definitions` | per `(clinicId, entityType)`: the clinic's pages and fields (console-written; see the clinic data contract) | unique `(clinicId, entityType)` |
+| `records` | `{clinicId, entityType, isActive, attributes}`: rows of custom pages (lab tests, services, …) | `(clinicId, entityType, isActive)` |
 | `appointments` | `{patientId, doctorId, date "YYYY-MM-DD", slot "HH:mm", status, createdAt, updatedAt, cancelledAt?}` | **unique partial `(doctorId, date, slot)`** where `status ∈ {Pending, Confirmed, Arrived, Completed}` |
 | `transcripts` | per phone, see `history.py` | – |
 | `conversations` | per conversation, see `conversations.py`. `channel` is `whatsapp` or `voice`; voice docs add `callId` and `durationSec`. `phone` is E.164 (`+` prefixed), timestamps are ISO-8601 UTC strings | unique `externalId`; `(clinicId, startedAt)`, `(clinicId, outcome, startedAt)`, `(clinicId, escalated, startedAt)`, `(phone, startedAt)` |
-| `pending_messages` | `{phone, messages[], deadline, firstAt}` (ISO strings) | unique `phone`; `deadline` |
+| `pending_messages` | `{clinicId, phone, messages[], deadline, firstAt}` (ISO strings) | unique `(clinicId, phone)`; `deadline` |
 
 Appointment statuses: `Pending` (all agent bookings), `Confirmed`, `Arrived`,
 `Completed`, `Cancelled`. Only `Cancelled` frees a slot.
 
-**Indexes are created only by the seed scripts**, not at app startup. Run
-`scripts/seed.py` against any new database, or the double-booking guard won't exist.
+Indexes are created at app startup (best effort: a failure is logged, not fatal) and
+by the seed / migration scripts.
+
+**Upgrading an existing database** to clinic scoping: run
+`uv run python scripts/migrate_clinic_scope.py --dry-run`, then without `--dry-run`.
+It backfills `clinicId` on old documents, creates the scoped indexes and drops the
+legacy phone-only unique indexes. Until it runs, documents without a `clinicId` are
+invisible to the agent.
 
 ---
 
@@ -567,7 +600,7 @@ Copy `.env.example` to `.env`. All settings live in
 uv sync
 cp .env.example .env                  # fill in the values above
 uv run python scripts/seed.py         # idempotent: clinic + 2 doctors + indexes
-# or, for a richer demo dataset (WIPES patients/appointments/conversations/transcripts/pending_messages/clinic/doctors):
+# or, for a richer demo dataset (WIPES this CLINIC_ID's patients/appointments/conversations/transcripts/pending_messages/clinic/doctors):
 # uv run python scripts/seed_demo.py
 uv run clinic-agent                   # serves on :$PORT (default 3000)
 ```
@@ -576,7 +609,9 @@ uv run clinic-agent                   # serves on :$PORT (default 3000)
 - `seed.py`: "ABC Clinic" (Mon–Sat 9–5); **Dr. Asha Mehta** (General Physician,
   Mon–Fri 09:00–13:00, 30 min) and **Dr. Rohit Sharma** (Dentist, Mon/Wed/Fri/Sat
   14:00–17:00, 20 min). It upserts by natural key and never touches patients or
-  appointments.
+  appointments. It also adds example clinic-configured data (doctor degrees /
+  experience / languages, and a "Lab tests" catalog with 4 tests), inserted only if
+  missing so console edits are never overwritten.
 - `seed_demo.py`: 7 doctors across specialties (General Physician, Dentist,
   Pediatrician, Cardiologist, Dermatologist, Orthopedic Surgeon, Gynecologist), a few
   sample patients, and existing `Confirmed` appointments on upcoming working days.

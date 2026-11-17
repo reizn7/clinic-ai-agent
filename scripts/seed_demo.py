@@ -5,8 +5,9 @@ sample patients, and existing appointments on upcoming working days (so
 availability shows real occupancy and "my appointments" has data).
 
 Run:  uv run python scripts/seed_demo.py
-It RESETS the runtime collections (conversations, transcripts, patients,
-appointments, pending_messages) and re-seeds clinic + doctors + sample data.
+It RESETS this clinic's (CLINIC_ID) runtime data (conversations, transcripts,
+patients, appointments, pending_messages) and re-seeds clinic + doctors + sample
+data. Other clinics sharing the database are not touched.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from clinic_agent.config import settings  # noqa: E402
 from clinic_agent.db import get_db  # noqa: E402
 from clinic_agent.runtime import conversations, debounce  # noqa: E402
 from clinic_agent.tools.repo import ensure_indexes  # noqa: E402
@@ -111,23 +113,28 @@ def main() -> None:
     db = get_db()
     db.client.admin.command("ping")
 
-    # Fresh runtime state.
+    # Fresh runtime state — THIS clinic only (the DB is shared with other clinics).
+    scope = {"clinicId": settings.CLINIC_ID}
     for c in ["conversations", "transcripts", "patients", "appointments", "pending_messages"]:
-        db[c].delete_many({})
-    db["clinic"].delete_many({})
-    db["doctors"].delete_many({})
+        db[c].delete_many(scope)
+    db["clinic"].delete_many(scope)
+    db["doctors"].delete_many(scope)
 
     # Clinic + doctors.
-    db["clinic"].insert_one(dict(CLINIC))
+    db["clinic"].insert_one({**CLINIC, **scope})
     now = datetime.now(UTC)
     for doc in DOCTORS:
-        db["doctors"].insert_one({**doc, "isActive": True, "createdAt": now, "updatedAt": now})
-    doctors = {d["name"]: d for d in db["doctors"].find()}
+        db["doctors"].insert_one(
+            {**doc, **scope, "isActive": True, "createdAt": now, "updatedAt": now}
+        )
+    doctors = {d["name"]: d for d in db["doctors"].find(scope)}
 
     # Patients.
     for p in PATIENTS:
-        db["patients"].insert_one({**p, "createdAt": now, "updatedAt": now})
-    patients = {p["phone"]: db["patients"].find_one({"phone": p["phone"]}) for p in PATIENTS}
+        db["patients"].insert_one({**p, **scope, "createdAt": now, "updatedAt": now})
+    patients = {
+        p["phone"]: db["patients"].find_one({**scope, "phone": p["phone"]}) for p in PATIENTS
+    }
 
     # Sample appointments: partially fill each doctor's next working day, plus one
     # on the demo patient's number so "my appointments" has data.
@@ -138,6 +145,7 @@ def main() -> None:
         doc = doctors[doctor_name]
         db["appointments"].insert_one(
             {
+                **scope,
                 "patientId": patients[phone]["_id"],
                 "doctorId": doc["_id"],
                 "date": date_key,
