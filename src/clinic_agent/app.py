@@ -1,4 +1,4 @@
-"""FastAPI application entrypoint for the clinic agent (v2): WhatsApp + Exotel voice."""
+"""FastAPI application entrypoint for the clinic agent (v2): WhatsApp + browser voice calls."""
 
 from __future__ import annotations
 
@@ -50,9 +50,10 @@ def create_app() -> FastAPI:
     # WhatsApp webhook (GET verify + POST inbound).
     app.include_router(webhook_router, prefix="/webhook")
 
-    # Exotel Voicebot WebSocket (phone channel → Gemini Live).
+    # Browser voice calls: the call page (GET /voice/call) and its WebSocket
+    # (WS /voice/ws), bridged to Gemini Live.
     if settings.VOICE_ENABLED:
-        from clinic_agent.voice.exotel import router as voice_router
+        from clinic_agent.voice.routes import router as voice_router
 
         app.include_router(voice_router)
     return app

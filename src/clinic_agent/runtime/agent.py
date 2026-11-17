@@ -7,7 +7,7 @@ channel style differ:
 
 * ``whatsapp`` — text model (``MODEL``) + ``SYSTEM_PROMPT``; run turn-by-turn.
 * ``voice`` — Live native-audio model (``VOICE_MODEL``) + ``VOICE_SYSTEM_PROMPT``;
-  run with ``Runner.run_live`` by the Exotel bridge.
+  run with ``Runner.run_live`` by the browser voice-call bridge (``voice.bridge``).
 """
 
 from __future__ import annotations

@@ -1,1 +1,1 @@
-"""Voice channel: Exotel Voicebot WebSocket ⇄ Gemini Live (ADK bidi streaming)."""
+"""Voice channel: browser call page ⇄ WebSocket (PCM16) ⇄ Gemini Live (ADK bidi streaming)."""

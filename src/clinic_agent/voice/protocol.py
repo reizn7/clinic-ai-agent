@@ -1,56 +1,51 @@
-"""Exotel Voicebot (AgentStream) WebSocket message parsing and builders.
+"""Wire protocol between the browser call page and ``WS /voice/ws``.
 
-Confirmed against developer.exotel.com/docs/agentstream/websocket-protocol and
-stream-voicebot-applet (2026-11):
+One JSON object per text frame, keyed by ``event``. Audio is base64 raw PCM:
+16-bit signed little-endian, mono.
 
-Inbound (Exotel → us), one JSON object per text frame, keyed by ``event``:
-  connected  {"event": "connected"}
-  start      {"event": "start", "sequence_number": "1", "stream_sid": "MZ…",
-              "start": {"stream_sid", "call_sid", "account_sid", "from", "to",
-                        "custom_parameters": {...},
-                        "media_format": {"encoding", "sample_rate", "bit_rate"}}}
-  media      {"event": "media", "sequence_number", "stream_sid",
-              "media": {"chunk", "timestamp", "payload": <base64 PCM>}}
-  dtmf       {"dtmf": {"digit", "duration"}}
-  mark       {"mark": {"name"}}            (our earlier mark finished playing)
-  stop       {"stop": {"call_sid", "account_sid", "reason": "stopped"|"callended"}}
+Client → server:
+  start  {"event": "start", "call_id": "<uuid>", "caller": "<phone as typed>",
+          "transcripts": true}
+  media  {"event": "media", "payload": "<base64 PCM16 @ 16 kHz>"}   (~100 ms)
+  stop   {"event": "stop"}
 
-Outbound (us → Exotel): ``media`` {"event","stream_sid","media":{"payload"}},
-``mark`` {"event","stream_sid","mark":{"name"}}, ``clear`` {"event","stream_sid"}.
-
-Exotel's docs mix string and number types (``sequence_number``/``chunk``), and
-their reference repo shows camelCase (``streamSid``/``callSid``); parsing here
-tolerates both.
+Server → client:
+  ready       {"event": "ready", "input_rate": 16000, "output_rate": 24000}
+              (the live session is up; start sending mic audio)
+  media       {"event": "media", "payload": "<base64 PCM16 @ output_rate>"}
+  clear       {"event": "clear"}  (barge-in: drop all queued playback now)
+  transcript  {"event": "transcript", "role": "user"|"assistant", "text": "...",
+               "final": bool}  (only when ``start.transcripts`` was true; a
+               partial carries the whole line so far, so the client replaces it)
+  end         {"event": "end", "reason": "..."}  (the server is ending the call)
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Any
+import re
+import uuid
+from dataclasses import dataclass
+from typing import Any, Literal
+
+# ``end`` reasons the server sends.
+END_INVALID_CALLER = "invalid_caller"
+END_NO_START = "no_start"
+END_SESSION_ENDED = "session_ended"
+END_ERROR = "error"
+
+_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @dataclass(frozen=True)
-class CallInfo:
-    stream_sid: str
-    call_sid: str
-    caller: str  # raw ``start.from`` (normalise with phone.normalize_phone)
-    callee: str = ""
-    account_sid: str = ""
-    sample_rate: int | None = None  # media_format.sample_rate, if Exotel sent one
-    custom_parameters: dict[str, Any] = field(default_factory=dict)
-
-
-def _pick(d: dict, *keys: str) -> Any:
-    for k in keys:
-        v = d.get(k)
-        if v not in (None, ""):
-            return v
-    return None
+class CallStart:
+    call_id: str
+    caller: str  # as typed by the patient; validate with phone.is_valid_phone
+    transcripts: bool = False
 
 
 def parse_message(text: str) -> dict[str, Any] | None:
-    """Decode one frame; ``None`` if it isn't a JSON object with an ``event``."""
+    """Decode one frame; ``None`` if it isn't a JSON object with a string ``event``."""
     try:
         msg = json.loads(text)
     except (ValueError, TypeError):
@@ -60,40 +55,45 @@ def parse_message(text: str) -> dict[str, Any] | None:
     return msg
 
 
-def parse_start(msg: dict[str, Any]) -> CallInfo:
-    start = msg.get("start") or {}
-    fmt = start.get("media_format") or start.get("mediaFormat") or {}
-    rate = _pick(fmt, "sample_rate", "sampleRate")
-    try:
-        sample_rate = int(rate) if rate is not None else None
-    except (TypeError, ValueError):
-        sample_rate = None
-    return CallInfo(
-        stream_sid=str(
-            _pick(start, "stream_sid", "streamSid") or _pick(msg, "stream_sid", "streamSid") or ""
-        ),
-        call_sid=str(_pick(start, "call_sid", "callSid") or ""),
-        caller=str(_pick(start, "from", "From", "caller") or ""),
-        callee=str(_pick(start, "to", "To") or ""),
-        account_sid=str(_pick(start, "account_sid", "accountSid") or ""),
-        sample_rate=sample_rate,
-        custom_parameters=dict(
-            start.get("custom_parameters") or start.get("customParameters") or {}
-        ),
+def parse_start(msg: dict[str, Any]) -> CallStart:
+    """Read a ``start`` frame, tolerating missing or mistyped fields.
+
+    A missing or malformed ``call_id`` (anything but 1-64 of ``[A-Za-z0-9_-]``) is
+    replaced by a server-generated one, since it is stored on the conversation.
+    A non-string ``caller`` becomes ``""`` (the bridge then rejects the call), and
+    ``transcripts`` is on only if it is literally ``true``.
+    """
+    call_id = msg.get("call_id")
+    if not isinstance(call_id, str) or not _CALL_ID_RE.match(call_id):
+        call_id = uuid.uuid4().hex
+    caller = msg.get("caller")
+    return CallStart(
+        call_id=call_id,
+        caller=caller.strip() if isinstance(caller, str) else "",
+        transcripts=msg.get("transcripts") is True,
     )
 
 
 def media_payload(msg: dict[str, Any]) -> str:
-    return str((msg.get("media") or {}).get("payload") or "")
+    payload = msg.get("payload")
+    return payload if isinstance(payload, str) else ""
 
 
-def media_event(stream_sid: str, payload_b64: str) -> str:
-    return json.dumps({"event": "media", "stream_sid": stream_sid, "media": {"payload": payload_b64}})
+def ready_event(input_rate: int, output_rate: int) -> str:
+    return json.dumps({"event": "ready", "input_rate": input_rate, "output_rate": output_rate})
 
 
-def clear_event(stream_sid: str) -> str:
-    return json.dumps({"event": "clear", "stream_sid": stream_sid})
+def media_event(payload_b64: str) -> str:
+    return json.dumps({"event": "media", "payload": payload_b64})
 
 
-def mark_event(stream_sid: str, name: str) -> str:
-    return json.dumps({"event": "mark", "stream_sid": stream_sid, "mark": {"name": name}})
+def clear_event() -> str:
+    return json.dumps({"event": "clear"})
+
+
+def transcript_event(role: Literal["user", "assistant"], text: str, final: bool) -> str:
+    return json.dumps({"event": "transcript", "role": role, "text": text, "final": final})
+
+
+def end_event(reason: str) -> str:
+    return json.dumps({"event": "end", "reason": reason})

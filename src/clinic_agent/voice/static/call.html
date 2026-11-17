@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Call the Clinic</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --text: #1b1f24;
+    --muted: #5d6673;
+    --border: #dfe3e8;
+    --accent: #1a7f5a;
+    --accent-text: #ffffff;
+    --danger: #c0392b;
+    --user-bubble: #e7f3ee;
+    --agent-bubble: #eef0f4;
+    --focus: #2b6cb0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418;
+      --card: #1a1e24;
+      --text: #e8ebef;
+      --muted: #9aa4b1;
+      --border: #2c323b;
+      --accent: #2fa77a;
+      --accent-text: #08130e;
+      --danger: #e5675a;
+      --user-bubble: #193328;
+      --agent-bubble: #242a33;
+      --focus: #7fb0ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 24px 16px calc(24px + env(safe-area-inset-bottom));
+  }
+  main { width: 100%; max-width: 480px; display: flex; flex-direction: column; gap: 16px; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  .sub { color: var(--muted); margin: 4px 0 0; font-size: 0.95rem; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+  }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  input[type="tel"] {
+    width: 100%;
+    font: inherit;
+    font-size: 1.1rem;
+    padding: 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+  }
+  input[type="tel"]:disabled { opacity: 0.7; }
+  .hint { color: var(--muted); font-size: 0.85rem; margin: 6px 0 0; }
+  button {
+    width: 100%;
+    margin-top: 14px;
+    font: inherit;
+    font-weight: 600;
+    font-size: 1.1rem;
+    padding: 14px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--accent-text);
+    cursor: pointer;
+  }
+  button.hangup { background: var(--danger); color: #fff; }
+  button:disabled { opacity: 0.6; cursor: default; }
+  input:focus-visible, button:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  #status { margin: 12px 0 0; min-height: 1.45em; color: var(--muted); }
+  #status.error { color: var(--danger); }
+  #status.live { color: var(--accent); font-weight: 600; }
+  .transcript-head { display: flex; justify-content: space-between; align-items: baseline; }
+  .transcript-head h2 { font-size: 1rem; margin: 0; }
+  #transcript {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 50vh;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
+  }
+  #transcript:empty::before { content: "The conversation will appear here."; color: var(--muted); font-size: 0.9rem; }
+  .line { padding: 8px 12px; border-radius: 12px; max-width: 88%; }
+  .line .who { display: block; font-size: 0.75rem; color: var(--muted); }
+  .line.user { align-self: flex-end; background: var(--user-bubble); }
+  .line.assistant { align-self: flex-start; background: var(--agent-bubble); }
+  .line.partial .text { opacity: 0.7; }
+  .tip { color: var(--muted); font-size: 0.85rem; text-align: center; margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Clinic receptionist</h1>
+    <p class="sub">Talk to our AI receptionist to book, move or cancel an appointment.</p>
+  </header>
+
+  <section class="card">
+    <form id="form" novalidate>
+      <label for="phone">Your phone number</label>
+      <input id="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+91 98765 43210" required>
+      <p class="hint">Include +91 or start with your 10-digit mobile number. Your appointments are linked to it.</p>
+      <button id="callBtn" type="submit">Call the clinic</button>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section class="card" aria-label="Live transcript">
+    <div class="transcript-head"><h2>Transcript</h2></div>
+    <div id="transcript"></div>
+  </section>
+
+  <p class="tip">Tip: use headphones so the receptionist doesn't hear itself.</p>
+</main>
+
+<script>
+"use strict";
+
+// ---- Audio worklets (inline, loaded from a Blob URL) ----------------------
+// capture: mic at the context rate -> mono PCM16 at targetRate, posted as
+//          100 ms Int16 frames (box-filter downsampling; fine for speech).
+// player:  Float32 chunks at inRate -> continuous output at the context rate
+//          (linear interpolation across chunk boundaries = gapless); "clear"
+//          drops everything queued.
+const WORKLET_SRC = `
+class Capture extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const target = options.processorOptions.targetRate;
+    this.ratio = sampleRate / target;
+    this.frameLen = Math.round(target / 10); // 100 ms
+    this.frame = new Int16Array(this.frameLen);
+    this.n = 0;
+    this.acc = 0;
+    this.count = 0;
+    this.pos = 0;
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input.length) return true;
+    const ch0 = input[0];
+    const ch1 = input.length > 1 ? input[1] : null;
+    for (let i = 0; i < ch0.length; i++) {
+      this.acc += ch1 ? (ch0[i] + ch1[i]) / 2 : ch0[i];
+      this.count++;
+      this.pos += 1;
+      if (this.pos >= this.ratio) {
+        this.pos -= this.ratio;
+        const s = Math.max(-1, Math.min(1, this.acc / this.count));
+        this.frame[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        this.acc = 0;
+        this.count = 0;
+        if (this.n === this.frameLen) {
+          // Transferring detaches the buffer, so allocate the next frame by
+          // the saved length, not this.frame.length (now 0).
+          this.port.postMessage(this.frame.buffer, [this.frame.buffer]);
+          this.frame = new Int16Array(this.frameLen);
+          this.n = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+
+class Player extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.step = options.processorOptions.inRate / sampleRate;
+    this.queue = [];
+    this.cur = null;
+    this.idx = 0;
+    this.a = 0;
+    this.b = 0;
+    this.frac = 0;
+    this.port.onmessage = (e) => {
+      if (e.data === "clear") {
+        this.queue = [];
+        this.cur = null;
+        this.idx = 0;
+        this.a = this.b = this.frac = 0;
+      } else {
+        this.queue.push(e.data);
+      }
+    };
+  }
+  next() {
+    while (!this.cur || this.idx >= this.cur.length) {
+      if (!this.queue.length) { this.cur = null; return 0; }
+      this.cur = this.queue.shift();
+      this.idx = 0;
+    }
+    return this.cur[this.idx++];
+  }
+  process(_inputs, outputs) {
+    const out = outputs[0][0];
+    for (let i = 0; i < out.length; i++) {
+      while (this.frac >= 1) {
+        this.a = this.b;
+        this.b = this.next();
+        this.frac -= 1;
+      }
+      out[i] = this.a + (this.b - this.a) * this.frac;
+      this.frac += this.step;
+    }
+    return true;
+  }
+}
+
+registerProcessor("capture", Capture);
+registerProcessor("player", Player);
+`;
+
+// ---- Page state ------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const form = $("form");
+const phoneInput = $("phone");
+const callBtn = $("callBtn");
+const statusEl = $("status");
+const transcriptEl = $("transcript");
+
+const END_MESSAGES = {
+  invalid_caller: "That phone number doesn't look right. Please check it and try again.",
+  no_start: "The call couldn't start. Please try again.",
+  session_ended: "The receptionist ended the call.",
+  error: "Something went wrong on our side. Please try again in a moment.",
+};
+
+let call = null; // {ws, ctx, stream, source, capture, player, mute, live, ended}
+
+function setStatus(text, kind) {
+  statusEl.textContent = text;
+  statusEl.className = kind || "";
+}
+
+function setInCall(inCall) {
+  phoneInput.disabled = inCall;
+  callBtn.disabled = false;
+  callBtn.textContent = inCall ? "Hang up" : "Call the clinic";
+  callBtn.classList.toggle("hangup", inCall);
+}
+
+// Mirrors the server's phone.is_valid_phone loosely; the server has the final say.
+function looksLikePhone(raw) {
+  const s = raw.trim();
+  if (!s || !/^\+?[\d\s().-]+$/.test(s)) return false;
+  let digits = s.replace(/\D/g, "");
+  if (!s.startsWith("+") && digits.startsWith("00")) digits = digits.slice(2);
+  else if (!s.startsWith("+") && digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+  return digits.length >= 10 && digits.length <= 15 && !digits.startsWith("0");
+}
+
+function wsUrl() {
+  const token = new URLSearchParams(location.search).get("token");
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const qs = token ? "?token=" + encodeURIComponent(token) : "";
+  return scheme + "//" + location.host + "/voice/ws" + qs;
+}
+
+function newCallId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function toBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+
+function pcm16ToFloat32(b64) {
+  const bin = atob(b64);
+  const n = bin.length >> 1;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (v >= 0x8000) v -= 0x10000;
+    out[i] = v / 0x8000;
+  }
+  return out;
+}
+
+// ---- Transcript --------------------------------------------------------------
+const openLine = { user: null, assistant: null };
+
+function showTranscript(role, text, final) {
+  if (role !== "user" && role !== "assistant") return;
+  let el = openLine[role];
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "line " + role;
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = role === "user" ? "You" : "Receptionist";
+    const body = document.createElement("span");
+    body.className = "text";
+    el.append(who, body);
+    transcriptEl.append(el);
+    openLine[role] = el;
+  }
+  el.querySelector(".text").textContent = text;
+  el.classList.toggle("partial", !final);
+  if (final) openLine[role] = null;
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+// ---- Call lifecycle --------------------------------------------------------------
+async function startCall() {
+  const raw = phoneInput.value;
+  if (!looksLikePhone(raw)) {
+    setStatus("Please enter a valid phone number, e.g. +91 98765 43210.", "error");
+    phoneInput.focus();
+    return;
+  }
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("Calls need a secure page (https:// or localhost).", "error");
+    return;
+  }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC || !("audioWorklet" in AC.prototype)) {
+    setStatus("This browser can't make calls. Please use a recent Chrome, Edge or Safari.", "error");
+    return;
+  }
+  try { localStorage.setItem("clinic-call-phone", raw.trim()); } catch (_) { /* optional */ }
+
+  // Create and resume the AudioContext synchronously inside the click (iOS needs
+  // a user gesture), before any await.
+  const ctx = new AC();
+  const resumed = ctx.resume();
+  call = { ctx, ws: null, stream: null, live: false, ended: false };
+  const thisCall = call;
+  setInCall(true);
+  callBtn.disabled = true;
+  setStatus("Requesting microphone…");
+  transcriptEl.textContent = "";
+  openLine.user = openLine.assistant = null;
+
+  try {
+    thisCall.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    });
+  } catch (err) {
+    const denied = err && (err.name === "NotAllowedError" || err.name === "SecurityError");
+    const missing = err && (err.name === "NotFoundError" || err.name === "OverconstrainedError");
+    finish(
+      denied ? "Microphone access was denied. Allow the microphone for this site and try again."
+        : missing ? "No microphone was found on this device."
+        : "Couldn't open the microphone (" + (err && err.name || "error") + ").",
+      "error",
+    );
+    return;
+  }
+  if (thisCall.ended) return;
+
+  try {
+    await resumed;
+    const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
+    await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    finish("Couldn't start audio in this browser.", "error");
+    return;
+  }
+  if (thisCall.ended) return;
+
+  setStatus("Connecting…");
+  callBtn.disabled = false;
+  const ws = new WebSocket(wsUrl());
+  thisCall.ws = ws;
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ event: "start", call_id: newCallId(), caller: raw.trim(), transcripts: true }));
+  };
+  ws.onmessage = (e) => onServerMessage(thisCall, e.data);
+  ws.onerror = () => {}; // onclose follows with the details
+  ws.onclose = (e) => {
+    if (thisCall.ended) return;
+    if (e.code === 1008) finish("This call link isn't valid (check the token in the URL).", "error");
+    else if (!thisCall.live) finish("Couldn't reach the clinic. Please check your connection and try again.", "error");
+    else finish("The call dropped unexpectedly.", "error");
+  };
+}
+
+function onServerMessage(c, data) {
+  if (c.ended) return;
+  let msg;
+  try { msg = JSON.parse(data); } catch (_) { return; }
+  switch (msg.event) {
+    case "ready":
+      goLive(c, msg.input_rate || 16000, msg.output_rate || 24000);
+      break;
+    case "media":
+      if (c.player && msg.payload) {
+        const pcm = pcm16ToFloat32(msg.payload);
+        c.player.port.postMessage(pcm, [pcm.buffer]);
+      }
+      break;
+    case "clear":
+      if (c.player) c.player.port.postMessage("clear");
+      break;
+    case "transcript":
+      showTranscript(msg.role, String(msg.text || ""), !!msg.final);
+      break;
+    case "end":
+      finish(END_MESSAGES[msg.reason] || "The call has ended.", msg.reason === "session_ended" ? "" : "error");
+      break;
+  }
+}
+
+function goLive(c, inputRate, outputRate) {
+  if (c.live) return;
+  const ctx = c.ctx;
+  c.player = new AudioWorkletNode(ctx, "player", {
+    numberOfInputs: 0,
+    outputChannelCount: [1],
+    processorOptions: { inRate: outputRate },
+  });
+  c.player.connect(ctx.destination);
+
+  c.source = ctx.createMediaStreamSource(c.stream);
+  c.capture = new AudioWorkletNode(ctx, "capture", {
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    processorOptions: { targetRate: inputRate },
+  });
+  c.capture.port.onmessage = (e) => {
+    if (c.live && !c.ended && c.ws && c.ws.readyState === WebSocket.OPEN) {
+      c.ws.send(JSON.stringify({ event: "media", payload: toBase64(e.data) }));
+    }
+  };
+  // Keep the capture node pulled by the graph without making it audible.
+  c.mute = ctx.createGain();
+  c.mute.gain.value = 0;
+  c.source.connect(c.capture);
+  c.capture.connect(c.mute);
+  c.mute.connect(ctx.destination);
+
+  c.live = true;
+  setStatus("Connected. Go ahead and speak.", "live");
+}
+
+function hangUp() {
+  if (!call) return;
+  const c = call;
+  if (c.ws && c.ws.readyState === WebSocket.OPEN) {
+    try { c.ws.send(JSON.stringify({ event: "stop" })); } catch (_) { /* closing anyway */ }
+  }
+  finish("Call ended.", "");
+}
+
+function finish(message, kind) {
+  const c = call;
+  if (!c || c.ended) return;
+  c.ended = true;
+  c.live = false;
+  call = null;
+  if (c.ws) {
+    c.ws.onclose = null;
+    try { c.ws.close(1000); } catch (_) { /* already closed */ }
+  }
+  if (c.stream) c.stream.getTracks().forEach((t) => t.stop());
+  for (const node of [c.source, c.capture, c.mute, c.player]) {
+    if (node) { try { node.disconnect(); } catch (_) { /* not connected */ } }
+  }
+  if (c.ctx && c.ctx.state !== "closed") c.ctx.close().catch(() => {});
+  for (const role of ["user", "assistant"]) {
+    if (openLine[role]) { openLine[role].classList.remove("partial"); openLine[role] = null; }
+  }
+  setInCall(false);
+  setStatus(message, kind);
+}
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (call) hangUp();
+  else startCall();
+});
+window.addEventListener("pagehide", () => { if (call) hangUp(); });
+
+try {
+  const saved = localStorage.getItem("clinic-call-phone");
+  if (saved) phoneInput.value = saved;
+} catch (_) { /* optional */ }
+</script>
+</body>
+</html>

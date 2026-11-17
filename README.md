@@ -1,12 +1,13 @@
 # clinic-ai-agent
 
-A **WhatsApp and phone AI receptionist for a medical clinic.** Patients message the
-clinic's WhatsApp number, or phone the clinic's Exotel number, and talk in natural
-language. A Google ADK + Gemini agent answers clinic questions, checks doctor
-availability, and books, reschedules, lists, or cancels appointments stored in
-MongoDB. Both channels share one "brain": the same tools, data, and core prompt
-rules. WhatsApp runs turn by turn on a text model; calls are bridged to a
-**Gemini Live** native-audio session. Every conversation is also recorded in a
+A **WhatsApp and browser voice-call AI receptionist for a medical clinic.** Patients
+message the clinic's WhatsApp number, or open the clinic's call page in a browser,
+enter their phone number, click "Call the clinic", and talk in natural language. A
+Google ADK + Gemini agent answers clinic questions, checks doctor availability, and
+books, reschedules, lists, or cancels appointments stored in MongoDB. Both channels
+share one "brain": the same tools, data, and core prompt rules. WhatsApp runs turn
+by turn on a text model; voice calls stream PCM audio over a WebSocket and are
+bridged to a **Gemini Live** native-audio session. Every conversation is also recorded in a
 console-ready shape (transcript, tool calls, outcome, escalation, plus an
 LLM-generated summary / sentiment / language) for a staff analytics dashboard.
 
@@ -17,8 +18,8 @@ hardcoded rule-engine/state machine was replaced by the LLM agent.
 
 > **Quick orientation:** the heart of the system is
 > [`runtime/turn.py`](src/clinic_agent/runtime/turn.py) (one message in → one reply
-> out), [`voice/bridge.py`](src/clinic_agent/voice/bridge.py) (one phone call:
-> Exotel audio ⇄ Gemini Live),
+> out), [`voice/bridge.py`](src/clinic_agent/voice/bridge.py) (one voice call:
+> browser audio ⇄ Gemini Live),
 > [`tools/booking_tools.py`](src/clinic_agent/tools/booking_tools.py) +
 > [`tools/repo.py`](src/clinic_agent/tools/repo.py) (what the agent can do), and
 > [`prompt.py`](src/clinic_agent/prompt.py) (how it behaves).
@@ -54,8 +55,7 @@ hardcoded rule-engine/state machine was replaced by the LLM agent.
 | LLM | Gemini via a Google AI Studio API key (`google-genai`), default model `gemini-3.5-flash-lite`; voice uses the Live API model `gemini-3.8-live` through ADK `Runner.run_live` |
 | Database | MongoDB via **synchronous** `pymongo` (wrapped in `asyncio.to_thread`), TLS CA from `certifi` |
 | Messaging | Meta WhatsApp Cloud API (Graph API) via `httpx` |
-| Telephony | Exotel Voicebot applet (bidirectional WebSocket, base64 16-bit PCM) |
-| Audio | `numpy` + `soxr` streaming resampler (Python 3.14 has no `audioop`) |
+| Voice transport | Browser page ⇄ WebSocket (base64 PCM16 in JSON frames), bridged to Gemini Live. The page captures 16 kHz with an AudioWorklet and plays the model's native output rate, so the server never resamples |
 | Config | `pydantic-settings` + `python-dotenv` |
 | Dev | `pytest` + `pytest-asyncio` (auto mode) + `mongomock`, `ruff` |
 
@@ -91,18 +91,18 @@ WhatsApp Cloud API
 │  runtime/sweeper.py  ── background loop: close idle conversations  │
 │                         → runtime/analytics.py (Gemini JSON call)  │
 │                                                                   │
-│  voice/exotel.py     ── WS /voice/exotel (token check, rate)       │
-│        ▼                                                          │
-│  voice/bridge.py     ── one call: Exotel PCM ⇄ ADK run_live        │
+│  voice/routes.py     ── GET /voice/call (page) · WS /voice/ws      │
+│        ▼                (token check)                             │
+│  voice/bridge.py     ── one call: page PCM ⇄ ADK run_live          │
 │        │                (agent "voice" = same tools, voice prompt) │
-│        ├─► voice/audio.py (resample 16k⇄24k, 320-byte chunks)     │
+│        ├─► voice/protocol.py + voice/audio.py (frames, chunking)  │
 │        └─► on hangup: history (`transcripts`) +                   │
 │                       conversations.finish_call (`conversations`) │
 └───────────────────────────────────────────────────────────────────┘
    ▲                                   │
-   │ wss (Exotel Voicebot applet)      ▼  MongoDB: clinic · doctors · patients ·
-Phone caller ──► Exotel                   appointments · transcripts ·
-                                          conversations · pending_messages
+   │ ws(s) /voice/ws (PCM16, JSON)     ▼  MongoDB: clinic · doctors · patients ·
+Browser call page                         appointments · transcripts ·
+(voice/static/call.html)                  conversations · pending_messages
                                                │
                          Gemini Live API ◄─────┘ (bridge ⇄ live session)
 ```
@@ -146,37 +146,60 @@ Phone caller ──► Exotel                   appointments · transcripts ·
 **The agent itself is stateless.** All memory between turns lives in MongoDB and is
 re-seeded into the prompt each turn.
 
-### One phone call, end to end
+### One voice call, end to end
 
-1. **Connect:** Exotel's Voicebot applet opens `wss://<host>/voice/exotel?sample-rate=16000&token=…`.
-   If `VOICE_WS_TOKEN` is set and `token` doesn't match, the socket is rejected (403).
-2. **`start`:** the bridge waits for Exotel's `start` event and reads `start.stream_sid`,
-   `start.call_sid` and `start.from` (the caller). It normalises the caller number
-   (`phone.normalize_phone`: `09876543210` / `+91 98765 43210` / `9876543210` →
-   `919876543210`) and opens an `active` `conversations` doc with `channel: "voice"`.
+The page and the server speak a small JSON protocol over `WS /voice/ws` (defined in
+[`voice/protocol.py`](src/clinic_agent/voice/protocol.py)). Audio is base64 PCM16 LE
+mono in `media` frames.
+
+| Direction | Frame |
+|---|---|
+| page → server | `{"event":"start","call_id","caller","transcripts":true}` · `{"event":"media","payload"}` (16 kHz, ~100 ms) · `{"event":"stop"}` |
+| server → page | `{"event":"ready","input_rate":16000,"output_rate":24000}` · `{"event":"media","payload"}` (at `output_rate`) · `{"event":"clear"}` · `{"event":"transcript","role","text","final"}` · `{"event":"end","reason"}` |
+
+1. **Open the page:** the patient opens `/voice/call?token=…`, types their number,
+   and clicks **Call the clinic**. Inside that click the page checks the number,
+   opens the microphone (echo cancellation, noise suppression, auto gain), creates
+   the AudioContext, and connects to `ws(s)://<host>/voice/ws?token=…`. If
+   `VOICE_WS_TOKEN` is set and `token` doesn't match, the socket is rejected (403).
+2. **`start`:** the page sends `start` with a random `call_id`, the number as typed,
+   and `transcripts: true`. The bridge validates the number (`phone.is_valid_phone`).
+   If it is empty or invalid, the server sends `end` (`invalid_caller`) and closes,
+   and no live session or conversation is created. Otherwise it normalises the number
+   (`phone.normalize_phone`: `+91 98765 43210` / `09876543210` / `9876543210` →
+   `919876543210`) and opens an `active` `conversations` doc with `channel: "voice"`
+   and `callId`. A socket that sends no `start` within 10 s gets `end` (`no_start`).
 3. **Seed:** the bridge builds the same context as a WhatsApp turn
    (`contextualize(..., channel="voice")`: today's date, the caller's number, prior
    `transcripts` history including tool results), adds a "greet the caller" cue, and
    sends it into a **fresh** ADK live session (random session id) on the voice runner.
    The model speaks first.
-4. **Stream** (two tasks):
-   - *upstream:* Exotel `media` → base64 decode → resample to 16 kHz (if Exotel isn't
-     already at 16 kHz) → `LiveRequestQueue.send_realtime(audio/pcm;rate=16000)`.
-     `stop` or a disconnect ends the call. `dtmf`/`mark` are logged at DEBUG and ignored.
-   - *downstream:* live events. Audio (24 kHz) is resampled to the Exotel rate,
-     re-chunked into ~100 ms payloads that are multiples of 320 bytes (min 3,200), and
-     sent as Exotel `media`. The remainder is flushed, zero-padded, on `turn_complete`.
-     On `interrupted` (barge-in) the bridge drops its buffer and sends Exotel `clear`.
-     Finished input/output transcriptions become user/assistant turns, and tool calls
-     are captured by the same `ToolCallRecorder` as `run_turn`.
+4. **`ready`:** the first live event proves the session is up. The bridge sends
+   `ready` with `input_rate` 16000 and the model's `output_rate`, read from the first
+   audio blob's MIME type (`audio/pcm;rate=24000`). The page only starts sending mic
+   audio after `ready`.
+5. **Stream** (two tasks):
+   - *upstream:* page `media` (16 kHz, already the model's input rate) → base64 decode
+     → `LiveRequestQueue.send_realtime(audio/pcm;rate=16000)`. `stop` or a disconnect
+     ends the call.
+   - *downstream:* live events. Model audio is passed through at its native rate,
+     re-chunked into ~100 ms `media` frames, and the remainder is flushed on
+     `turn_complete`. On `interrupted` (barge-in) the bridge drops its buffer and sends
+     `clear`, and the page drops all queued playback at once. Transcriptions become
+     `transcript` frames if requested: partials carry the line so far and are updated
+     in place, and `final: true` closes the line. A failed transcript send is logged
+     and never affects audio. Finished transcriptions become user/assistant turns, and
+     tool calls are captured by the same `ToolCallRecorder` as `run_turn`.
    ADK runs the tools itself (same `ALL_TOOLS`), and reconnects on the Live API's
    `goAway` using session resumption.
-5. **Hang up:** if a tool call is still in flight, the bridge waits up to 5 s for it,
-   then closes the live queue and the socket. Whatever happened (including errors), it
-   persists the call: its turns are appended to `transcripts` (so the next chat or call
-   remembers it), and the conversation is finalized with `conversations.finish_call`
-   (messages, derived fields, `durationSec`, final status). That makes it eligible
-   for analytics right away.
+6. **Hang up:** if the page hangs up (`stop` or a closed socket) while a tool call is
+   in flight, the bridge waits up to 5 s for it. If the live session ends or fails
+   first, the page gets `end` (`session_ended` or `error`). Either way the bridge
+   closes the live queue and the socket, then persists the call: its turns are
+   appended to `transcripts` (so the next chat or call remembers it), and the
+   conversation is finalized with `conversations.finish_call` (messages, derived
+   fields, `durationSec`, final status). That makes it eligible for analytics right
+   away.
 
 ---
 
@@ -187,7 +210,7 @@ src/clinic_agent/
   app.py                 FastAPI app, health routes, lifespan (starts sweeper + flusher), main()
   config.py              Settings singleton (env / .env), with v1-name aliases
   db.py                  Cached MongoClient + create_index_safe()
-  phone.py               normalize_phone() (Exotel formats → digits) + to_e164()
+  phone.py               normalize_phone() / is_valid_phone() (typed numbers → digits) + to_e164()
   prompt.py              BASE_PROMPT + WHATSAPP_STYLE / VOICE_STYLE → SYSTEM_PROMPT / VOICE_SYSTEM_PROMPT
   whatsapp/
     webhook.py           GET verify · POST inbound (debounce or direct background reply)
@@ -208,15 +231,16 @@ src/clinic_agent/
     repo.py              sync data access: clinic/doctors/patients/appointments + indexes
     slots.py             slot generation from working hours
   voice/
-    exotel.py            WS /voice/exotel router (token check, ?sample-rate=), mounted if VOICE_ENABLED
-    bridge.py            run_call(): one call, Exotel ⇄ ADK live session, persistence on hangup
-    protocol.py          Exotel event parsing (start/media/stop) + outbound media/clear/mark
-    audio.py             base64, soxr streaming resampler, Exotel 320-byte chunker
+    routes.py            GET /voice/call (page) + WS /voice/ws (token check), mounted if VOICE_ENABLED
+    bridge.py            run_call(): one call, page ⇄ ADK live session, persistence on hangup
+    protocol.py          call-page protocol: parse start/media, build ready/media/clear/transcript/end
+    audio.py             base64, MIME rate parsing, ~100 ms outbound chunker
+    static/call.html     the browser call page (vanilla JS, AudioWorklets, no build step)
 scripts/
   seed.py                idempotent: 1 clinic + 2 doctors + all indexes
   seed_demo.py           DESTRUCTIVE: wipes data, seeds 7 doctors, sample patients + appointments
   smoke_live.py          live end-to-end check (real Mongo + Gemini, no WhatsApp send)
-  voice_sim.py           local Exotel simulator: streams WAV / `say` audio, saves replies to out.wav
+  voice_sim.py           local call-page simulator: streams WAV / `say` audio, saves replies to out.wav
 tests/                   unit tests (pytest + mongomock, no live services)
 Dockerfile               uv + Python 3.14 image
 PLAN.md                  original design plan & decisions (partly historical, see note below)
@@ -238,15 +262,20 @@ v1/                      original Node.js/Express/Mongoose prototype (reference 
   `GET /healthz` (`{"status": "ok"}`), and mounts the webhook router at `/webhook`.
 - `lifespan` starts `sweeper.run_forever()` and `flusher.run_forever()` as asyncio
   tasks and cancels them on shutdown.
-- When `VOICE_ENABLED` is true, it also mounts the Exotel WebSocket router (`/voice/exotel`).
+- When `VOICE_ENABLED` is true, it also mounts the voice router: the call page
+  (`GET /voice/call`) and its WebSocket (`WS /voice/ws`).
 - `main()` is the `clinic-agent` console script. It runs uvicorn on `0.0.0.0:$PORT`.
 
 ### `phone.py`
-- `normalize_phone(raw, default_cc="91")` returns digits with the country code and no
-  `+`, the form `patients.phone` and `transcripts` use. It handles `+91…`, a trunk `0`
-  plus 10 digits, bare 10-digit national numbers (India assumed), and a `00` prefix.
-  Digits that already carry a country code pass through unchanged. Only the voice path
-  calls it; WhatsApp `from` is already canonical.
+- `normalize_phone(raw, default_cc="91")` turns a number typed on the call page into
+  digits with the country code and no `+`, the form `patients.phone` and `transcripts`
+  use. It handles `+91…`, a trunk `0` plus 10 digits, bare 10-digit national numbers
+  (India assumed), and a `00` prefix. Digits that already carry a country code pass
+  through unchanged. Only the voice path calls it; WhatsApp `from` is already canonical.
+- `is_valid_phone(raw)` accepts only phone punctuation (digits, spaces, `+ - ( ) .`,
+  with `+` only at the start). After normalising, the number must be 8–15 digits with
+  a non-zero country code, and an Indian (`91`) number must have exactly 10 national
+  digits. The bridge rejects a call whose `caller` fails this check.
 - `to_e164(phone)` adds the `+` used by `conversations.phone`, without re-interpreting
   the number.
 
@@ -293,7 +322,8 @@ the staff console. Each doc has a `channel`: `whatsapp` or `voice`.
   minutes old. When it rotates, it finalizes the stale conversation first. It never
   picks up an active `voice` conversation.
 - **Voice:** each call is exactly **one** conversation, with no rotation.
-  `start_call()` inserts it as `active` (with `callSid`) when the call connects.
+  `start_call()` inserts it as `active` (with `callId`, the page's `call_id`) once the
+  caller's number has been accepted.
   `finish_call()` writes all turns at hangup, sets `durationSec`, derived fields, and
   the final status, and clears any `analyticsStatus`, so analytics runs on the full
   call. The opening greeting turn has no patient message.
@@ -352,35 +382,52 @@ out the booked ones.
 `https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages` with a
 Bearer token and a 15s timeout, and raises on HTTP ≥400. Only plain text is sent.
 
-### `voice/exotel.py`
-`@router.websocket("/voice/exotel")`. It rejects the socket (close 1008, which is a
-403 before accept) when `VOICE_WS_TOKEN` is set and `?token=` doesn't match
-(constant-time compare). It reads `?sample-rate=` (8000/16000/24000, falling back to
-`VOICE_SAMPLE_RATE`), accepts, and hands off to `bridge.run_call`.
+### `voice/routes.py`
+`GET /voice/call` returns the call page (`static/call.html`, read once at import).
+`@router.websocket("/voice/ws")` rejects the socket (close 1008, which is a 403 before
+accept) when `VOICE_WS_TOKEN` is set and `?token=` doesn't match (constant-time
+compare), then accepts and hands off to `bridge.run_call`.
 
 ### `voice/bridge.py`
-`run_call(ws, sample_rate=, runner=, run_config=)` handles one call and **never
-raises** (see "One phone call" above). `CallBridge` holds the per-call state: live
-queue, recorder, transcript, chunker, and resamplers. `CallTranscript` groups finished
-transcriptions and tool calls into turns: caller speech after the agent has spoken
-starts a new turn. `get_runner()` lazily builds the module-level
+`run_call(ws, runner=, run_config=)` handles one call and **never raises** (see "One
+voice call" above). It waits up to `START_TIMEOUT_SECONDS` (10) for `start` and
+rejects invalid callers before building anything. `CallBridge` holds the per-call
+state: live queue, recorder, transcript, partial transcription text, and the
+chunker, which is created at `ready` for the model's output rate. `CallTranscript`
+groups finished transcriptions and tool calls into turns: caller speech after the
+agent has spoken starts a new turn. `get_runner()` lazily builds the module-level
 `InMemoryRunner(build_agent("voice"))`. `build_run_config()` sets BIDI streaming,
 `AUDIO` response modality, input and output transcription, an optional prebuilt voice
 (`VOICE_NAME`), sliding-window context compression (to get past the ~15 min
 audio-session cap), and session resumption (so ADK reconnects on `goAway`).
 
 ### `voice/protocol.py`
-Parses Exotel frames (`parse_message`, `parse_start` → `CallInfo{stream_sid, call_sid,
-caller, callee, account_sid, sample_rate, custom_parameters}`, `media_payload`). It
-accepts both the documented snake_case and the camelCase seen in Exotel's sample repo.
-It also builds outbound `media` / `clear` / `mark` events.
+`parse_message` decodes a frame. `parse_start` → `CallStart{call_id, caller,
+transcripts}`: a missing or malformed `call_id` (anything but 1–64 of
+`[A-Za-z0-9_-]`) is replaced by a server-generated one, a non-string `caller` becomes
+`""`, and `transcripts` is on only when it is literally `true`. `media_payload` reads
+a `media` frame. Builders: `ready_event`, `media_event`, `clear_event`,
+`transcript_event`, `end_event`, plus the `END_*` reason constants (`invalid_caller`,
+`no_start`, `session_ended`, `error`).
 
 ### `voice/audio.py`
-`b64decode`/`b64encode`, `rate_from_mime`, `StreamResampler` (stateful soxr, carries
-odd bytes, `reset()` on barge-in), and `OutboundChunker`. The chunker emits exact
-`chunk_size_for(rate)` chunks (~100 ms, a multiple of 320, clamped to Exotel's
-3,200–100,000 bytes), holds the remainder, flushes zero-padded, and `clear()`s on
-barge-in.
+`b64decode`/`b64encode`, `rate_from_mime`, `whole_samples` (drops a trailing odd
+byte), `chunk_size_for(rate)` (~100 ms of whole samples), and `OutboundChunker`. The
+chunker emits fixed-size chunks, holds the remainder, flushes it as-is on turn end,
+and `clear()`s on barge-in. There is no resampling: the page sends 16 kHz, which is
+the model's input rate, and plays the model's output rate itself.
+
+### `voice/static/call.html`
+One self-contained page (vanilla JS, no external scripts, light/dark, phone-sized).
+It reads `token` from its own URL and derives `ws:`/`wss:` from `location.protocol`.
+Two inline AudioWorklets (loaded from a Blob URL) handle the audio:
+- `capture` downmixes the mic to mono, downsamples from the context rate to
+  `input_rate` with a box filter, and posts 100 ms PCM16 frames (3,200 bytes).
+- `player` keeps a queue of chunks at `output_rate` and plays them gaplessly at the
+  context rate with linear interpolation. `clear` empties the queue at once.
+
+The transcript panel updates partial lines in place. Hanging up sends `stop`, closes
+the socket, stops the mic tracks, and closes the AudioContext.
 
 ---
 
@@ -461,7 +508,7 @@ Database name comes from `MONGO_DB_NAME` (default `clinic-ai-agent`).
 | `patients` | `{phone, name, age, gender, createdAt, updatedAt}`. `phone` is the raw WhatsApp `from` (digits, no `+`) | unique `phone` |
 | `appointments` | `{patientId, doctorId, date "YYYY-MM-DD", slot "HH:mm", status, createdAt, updatedAt, cancelledAt?}` | **unique partial `(doctorId, date, slot)`** where `status ∈ {Pending, Confirmed, Arrived, Completed}` |
 | `transcripts` | per phone, see `history.py` | – |
-| `conversations` | per conversation, see `conversations.py`. `channel` is `whatsapp` or `voice`; voice docs add `callSid` and `durationSec`. `phone` is E.164 (`+` prefixed), timestamps are ISO-8601 UTC strings | unique `externalId`; `(clinicId, startedAt)`, `(clinicId, outcome, startedAt)`, `(clinicId, escalated, startedAt)`, `(phone, startedAt)` |
+| `conversations` | per conversation, see `conversations.py`. `channel` is `whatsapp` or `voice`; voice docs add `callId` and `durationSec`. `phone` is E.164 (`+` prefixed), timestamps are ISO-8601 UTC strings | unique `externalId`; `(clinicId, startedAt)`, `(clinicId, outcome, startedAt)`, `(clinicId, escalated, startedAt)`, `(phone, startedAt)` |
 | `pending_messages` | `{phone, messages[], deadline, firstAt}` (ISO strings) | unique `phone`; `deadline` |
 
 Appointment statuses: `Pending` (all agent bookings), `Confirmed`, `Arrived`,
@@ -497,11 +544,10 @@ Copy `.env.example` to `.env`. All settings live in
 | `DEBOUNCE_WINDOW_SECONDS` | `5.0` | Quiet gap before flushing |
 | `DEBOUNCE_MAX_WAIT_SECONDS` | `30.0` | Hard cap even while the user keeps typing |
 | `DEBOUNCE_TICK_SECONDS` | `1.0` | Flusher poll interval |
-| `VOICE_ENABLED` | `true` | Mount the Exotel WebSocket at `/voice/exotel` |
-| `VOICE_MODEL` | `gemini-3.8-live` | Gemini Live native-audio model for calls (must support function calling) |
+| `VOICE_ENABLED` | `true` | Serve browser voice calls: the page at `/voice/call` and its WebSocket at `/voice/ws` |
+| `VOICE_MODEL` | `gemini-3.8-live` | Gemini Live native-audio model for voice calls (must support function calling) |
 | `VOICE_NAME` | `""` | Optional prebuilt voice (e.g. `Kore`, `Puck`); empty means the model default |
-| `VOICE_SAMPLE_RATE` | `16000` | PCM rate requested from Exotel (`8000`/`16000`/`24000`); must match `?sample-rate=` in the applet URL |
-| `VOICE_WS_TOKEN` | `""` | Optional shared secret; if set, the WS URL must carry `?token=<value>` |
+| `VOICE_WS_TOKEN` | `""` | Optional shared secret; if set, open the page as `/voice/call?token=<value>` (the page passes it to the WebSocket) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `PORT` | `3000` | HTTP port |
 
@@ -546,31 +592,31 @@ to `https://<tunnel>/webhook` and the verify token to your `VERIFY_TOKEN`, then
 subscribe to the **`messages`** field. In dev mode, add your own number as a test
 recipient under **API Setup**, then text the business number.
 
-### Connect Exotel (local dev)
+### Voice calls in the browser (local dev)
 
 ```bash
 uv run clinic-agent
 cloudflared tunnel --url http://localhost:3000      # or: ngrok http 3000
 ```
 
-In the Exotel dashboard, build a call flow (App Bazaar) for your ExoPhone with a
-**Voicebot** applet, and set its URL to:
+Open `https://<tunnel-host>/voice/call?token=<VOICE_WS_TOKEN>` (leave out `token` if
+`VOICE_WS_TOKEN` is empty), enter a phone number, and click **Call the clinic**. On
+the same machine, `http://localhost:3000/voice/call` works without HTTPS. Browsers
+only allow the microphone on HTTPS or localhost. The agent greets you first. **Use
+headphones**, so the agent doesn't hear itself through your speakers and interrupt
+itself.
 
-```
-wss://<tunnel-host>/voice/exotel?sample-rate=16000&token=<VOICE_WS_TOKEN>
-```
+Browser support: desktop Chrome/Edge and Android Chrome are the targets. iOS Safari
+(14.5+, which has AudioWorklet) should work but is best-effort. See the known
+limitations.
 
-`sample-rate` must match `VOICE_SAMPLE_RATE`. Leave out `token` only if
-`VOICE_WS_TOKEN` is empty. Call the ExoPhone; the agent greets you first. Run with
-`LOG_LEVEL=DEBUG` to log the raw `start` payload (to confirm field names) and the
-ignored `dtmf`/`mark` events.
+### Test calls without a browser: `scripts/voice_sim.py`
 
-### Test calls without a phone: `scripts/voice_sim.py`
-
-The simulator acts like Exotel against a local server. It sends `connected` and
-`start` (fake caller, default `+919876500001`), streams caller audio as real-time
-100 ms `media` frames (silence between utterances), waits for each reply to finish,
-writes everything the agent said to `out.wav`, and sends `stop`.
+The simulator behaves like the call page against a local server. It sends `start`
+(fake caller, default `+919876500001`), waits for `ready`, streams caller audio as
+real-time 100 ms 16 kHz `media` frames (silence between utterances), waits for each
+reply to finish, prints the final `transcript` lines, writes everything the agent
+said to `out.wav` at the `output_rate` from `ready`, and sends `stop`.
 
 ```bash
 uv run python scripts/voice_sim.py                       # greeting only → out.wav
@@ -582,10 +628,11 @@ uv run python scripts/voice_sim.py \
   --say "Yes, please book it"                            # macOS `say` synthesises each turn
 ```
 
-Options: `--url` (default `ws://localhost:3000/voice/exotel`), `--rate`, `--token`,
-`--caller`, `--out`, `--reply-gap`, `--max-reply`. Afterwards, check the
-`conversations` doc (`channel: "voice"`, `callSid` from the simulator's log) for the
-`book_appointment` tool call.
+Options: `--url` (default `ws://localhost:3000/voice/ws`), `--token`, `--caller`,
+`--out`, `--reply-gap`, `--max-reply`, `--no-transcripts`. `--say` needs macOS
+`say`; elsewhere, use `--wav`. Afterwards, check the `conversations` doc
+(`channel: "voice"`, `callId` from the simulator's log) for the `book_appointment`
+tool call.
 
 ---
 
@@ -607,13 +654,14 @@ uv run ruff check .      # lint (line length 100; v1/ excluded)
 | `test_sweeper.py` | idle close and analytics claim/apply |
 | `test_debounce.py` | enqueue/claim/requeue windows and cap |
 | `test_webhook.py` | verify handshake and inbound parsing |
-| `test_phone.py` | phone normalisation (Exotel formats) and E.164 |
+| `test_phone.py` | phone normalisation, `is_valid_phone`, and E.164 |
 | `test_prompt.py` | WhatsApp prompt pinned by hash; voice prompt composition; `build_agent(channel)` |
 | `test_tool_capture.py` | function call/response pairing, status, duration |
-| `test_voice_audio.py` | chunk sizes, remainder/flush padding, resampled lengths |
-| `test_voice_protocol.py` | Exotel `start`/`media` parsing, outbound events |
-| `test_voice_conversations.py` | one conversation per call, derived fields, analytics eligibility, WhatsApp isolation |
-| `test_voice_bridge.py` | full call against a fake live runner (audio, barge-in `clear`, transcription, tool call, persistence), failure handling, token/rate routing |
+| `test_voice_audio.py` | chunk sizes, remainder, flush, clear |
+| `test_voice_protocol.py` | `start` parsing (incl. missing/invalid fields), every outbound builder |
+| `test_voice_conversations.py` | one conversation per call (`callId`), derived fields, analytics eligibility, WhatsApp isolation |
+| `test_voice_bridge.py` | full call against a fake live runner (`ready`, native-rate audio, barge-in `clear`, transcript frames only when requested, tool call, persistence), `end` on session end/error, invalid caller, start timeout |
+| `test_voice_routes.py` | token accept/reject on `/voice/ws`, `/voice/call` served only when `VOICE_ENABLED`, no other voice routes |
 
 Tests patch `get_db` with `mongomock`. pytest runs with `asyncio_mode = "auto"` and
 `--import-mode=importlib`.
@@ -702,24 +750,39 @@ Keep these true when changing the code:
 - **Indexes are created only by the seed scripts** (see the data model section).
 - **Single clinic / single agent.** `CLINIC_ID` is stamped on conversations, but there
   is no multi-tenancy.
-- **Voice: no call transfer yet.** `escalate_to_human` only flags the conversation;
-  the agent tells the caller the clinic will call back. Nobody is notified.
+- **Voice: the caller's number is self-entered and unverified.** Anyone with the page
+  link can type any number and then see and manage that number's appointments. A real
+  deployment needs OTP (or another proof of ownership) before the call starts.
+- **Voice: no call transfer.** `escalate_to_human` only flags the conversation; the
+  agent tells the caller the clinic will call back. Nobody is notified.
 - **Voice: Live session limits.** Audio-only Live sessions are capped at about 15
   minutes unless context compression is on (it is). Connections are recycled about
-  every 10 minutes, and ADK reconnects with session resumption. Exotel caps a stream at
-  60 minutes. If the live session still ends, the call ends; it is persisted, but the
-  caller hears no goodbye.
-- **Voice: WS secured only by an optional token** in the URL (`VOICE_WS_TOKEN`). The
-  URL is not signed, and Exotel's Basic-auth / IP-allowlist options are not used.
+  every 10 minutes, and ADK reconnects with session resumption. If the live session
+  still ends, the page gets `end` (`session_ended`/`error`) and the call is persisted,
+  but the caller hears no goodbye.
+- **Voice: plain WebSocket audio.** PCM over TCP has no jitter buffer or packet-loss
+  concealment beyond what the page queues, so audio can stutter or lag on poor mobile
+  networks. Each direction is about 256 kbit/s of base64 PCM.
+- **Voice: echo.** The page asks for browser echo cancellation, but Chrome doesn't
+  reliably cancel audio played through Web Audio, so on laptop speakers the agent can
+  hear itself and barge in on itself. Use headphones.
+- **Voice: iOS Safari is best-effort.** It needs iOS 14.5+ (AudioWorklet). While the
+  mic is open, iOS may route playback to the earpiece or play it quietly. Locking the
+  screen or switching apps suspends the AudioContext and the call goes silent. Neither
+  is handled.
+- **Voice: WS secured only by an optional shared token** in the page URL
+  (`VOICE_WS_TOKEN`). It is not per-user and not signed, and the page itself is public.
 - **Voice: function-calling mode is model-dependent.** `gemini-3.8-live` may default
   to *non-blocking* tool calls, so the model could keep talking while a tool runs. The
   prompt forbids describing results before they arrive, but verify on real calls.
-- **Voice: no call recording, DTMF, or outbound calls.** If the caller hangs up while
-  a tool is running, the bridge waits up to 5 s to record its result.
+- **Voice: no call recording.** If the caller hangs up while a tool is running, the
+  bridge waits up to 5 s to record its result.
 - **Voice transcript grouping is heuristic.** Turns are built from finished
   transcriptions, and Gemini 3.x sends one final input transcription per utterance,
   sometimes after the reply has started. So in rare cases a caller line can land one
   turn late in the stored record.
+- **No telephony.** Calls come only from the browser page. A phone provider could be
+  added later by writing a new protocol adapter in front of the same `CallBridge`.
 
 ---
 
@@ -729,7 +792,9 @@ Keep these true when changing the code:
 |---|---|
 | Change the agent's tone, flow, or rules | `src/clinic_agent/prompt.py` (`BASE_PROMPT` for both channels, `WHATSAPP_STYLE` / `VOICE_STYLE` per channel) |
 | Change the voice model or voice | `VOICE_MODEL` / `VOICE_NAME` env vars; Live session options in `voice/bridge.py::build_run_config` |
-| Change call audio handling (rates, chunking, barge-in) | `voice/audio.py`, `voice/bridge.py::CallBridge._on_event` |
+| Change the call page (UI, mic capture, playback) | `voice/static/call.html` (restart the server; it is read once at startup) |
+| Change the call wire protocol | `voice/protocol.py` + `voice/bridge.py` + `call.html` + `scripts/voice_sim.py` |
+| Change call audio handling (chunking, barge-in) | `voice/audio.py`, `voice/bridge.py::CallBridge._on_event` |
 | Change how a call is recorded | `voice/bridge.py::CallBridge._persist`, `runtime/conversations.py::finish_call` |
 | Add or change a capability | `tools/repo.py` (logic) + `tools/booking_tools.py` (tool + docstring) + `ALL_TOOLS` + `conversations._TOOL_INTENT` + `prompt.py` tool list |
 | Change the model | `MODEL` env var (analytics picks the right thinking config automatically) |

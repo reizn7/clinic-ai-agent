@@ -48,10 +48,10 @@ def _turns(*specs):
 
 async def test_start_call_creates_active_voice_conversation(db):
     started = datetime.now(UTC)
-    cid = await conv.start_call(PHONE, "CA1", started)
+    cid = await conv.start_call(PHONE, "call-1", started)
     doc = db[conv.COLLECTION].find_one({"externalId": cid})
     assert doc["channel"] == "voice"
-    assert doc["callSid"] == "CA1"
+    assert doc["callId"] == "call-1"
     assert doc["phone"] == "+919876543210"
     assert doc["status"] == "active"
     assert doc["startedAt"] == started.isoformat()
@@ -60,7 +60,7 @@ async def test_start_call_creates_active_voice_conversation(db):
 
 async def test_finish_call_writes_turns_and_derived_fields(db):
     started = datetime.now(UTC) - timedelta(seconds=95)
-    cid = await conv.start_call(PHONE, "CA1", started)
+    cid = await conv.start_call(PHONE, "call-1", started)
     turns = _turns(
         (conv.CALL_STARTED, "Hello, ABC Clinic.", []),
         ("Book me with Dr Asha Monday", "10:30 is free. Shall I book?", [AVAIL_OK]),
@@ -96,7 +96,7 @@ async def test_finish_call_writes_turns_and_derived_fields(db):
 
 async def test_escalated_call_status(db):
     started = datetime.now(UTC)
-    cid = await conv.start_call(PHONE, "CA2", started)
+    cid = await conv.start_call(PHONE, "call-2", started)
     turns = _turns(("I have a billing question", "The clinic will call you back.", [ESCALATE_OK]))
     await conv.finish_call(cid, PHONE, turns, started, datetime.now(UTC))
     doc = db[conv.COLLECTION].find_one({"externalId": cid})
@@ -107,7 +107,7 @@ async def test_escalated_call_status(db):
 
 async def test_empty_call_is_abandoned(db):
     started = datetime.now(UTC)
-    cid = await conv.start_call(PHONE, "CA3", started)
+    cid = await conv.start_call(PHONE, "call-3", started)
     await conv.finish_call(cid, PHONE, [], started, datetime.now(UTC))
     doc = db[conv.COLLECTION].find_one({"externalId": cid})
     assert doc["status"] == "abandoned"
@@ -117,7 +117,7 @@ async def test_empty_call_is_abandoned(db):
 
 async def test_finished_call_is_eligible_for_analytics(db):
     started = datetime.now(UTC)
-    cid = await conv.start_call(PHONE, "CA4", started)
+    cid = await conv.start_call(PHONE, "call-4", started)
     # simulate the sweeper having analysed a stale snapshot mid-call
     db[conv.COLLECTION].update_one({"externalId": cid}, {"$set": {"analyticsStatus": "complete"}})
     turns = _turns(("Hi", "Hello!", []))
@@ -130,7 +130,7 @@ async def test_finished_call_is_eligible_for_analytics(db):
 
 async def test_whatsapp_never_appends_to_active_voice_call(db):
     started = datetime.now(UTC)
-    cid = await conv.start_call(PHONE, "CA5", started)
+    cid = await conv.start_call(PHONE, "call-5", started)
     await conv.record_turn(PHONE, "hi on whatsapp", "hello", [], 100)
 
     voice = db[conv.COLLECTION].find_one({"externalId": cid})

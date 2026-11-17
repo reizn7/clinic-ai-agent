@@ -1,7 +1,7 @@
 [project]
 name = "clinic-ai-agent"
 version = "2.0.0"
-description = "WhatsApp + phone (Exotel → Gemini Live) clinic AI agent — Google ADK (Gemini) + FastAPI, MongoDB-backed."
+description = "WhatsApp + browser voice-call (Gemini Live) clinic AI agent — Google ADK (Gemini) + FastAPI, MongoDB-backed."
 readme = "PLAN.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
@@ -15,8 +15,6 @@ dependencies = [
     "pydantic-settings>=2.4",
     "python-dotenv>=1.0",
     "certifi>=2024.0",
-    "numpy>=2.5.4",
-    "soxr>=1.1.0",
 ]
 
 [project.scripts]

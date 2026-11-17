@@ -54,12 +54,11 @@ class Settings(BaseSettings):
     DEBOUNCE_MAX_WAIT_SECONDS: float = 30.0  # hard cap even if still typing
     DEBOUNCE_TICK_SECONDS: float = 1.0  # how often the flusher polls
 
-    # --- Voice channel (Exotel Voicebot → Gemini Live) ---
-    VOICE_ENABLED: bool = True  # mount the /voice/exotel WebSocket
+    # --- Voice channel (browser call page → Gemini Live) ---
+    VOICE_ENABLED: bool = True  # serve GET /voice/call (page) + WS /voice/ws (call audio)
     VOICE_MODEL: str = "gemini-3.8-live"  # Live API native-audio model (function calling)
     VOICE_NAME: str = ""  # optional prebuilt voice, e.g. "Kore"; empty = model default
-    VOICE_SAMPLE_RATE: int = 16000  # PCM rate we ask Exotel for (?sample-rate=)
-    VOICE_WS_TOKEN: str = ""  # optional shared secret; if set, WS URL needs ?token=
+    VOICE_WS_TOKEN: str = ""  # optional shared secret; if set, open /voice/call?token=<it>
 
     # --- App ---
     LOG_LEVEL: str = "INFO"

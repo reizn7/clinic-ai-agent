@@ -5,8 +5,8 @@ Implements the staff-console data contract: one document per *conversation*
 the agent's own ``transcripts``. ``channel`` says where it happened:
 
 * ``whatsapp`` — sessionised by a 30-minute idle window (``record_turn``).
-* ``voice`` — exactly one conversation per phone call, no rotation
-  (``start_call`` on connect, ``finish_call`` on hangup), plus ``callSid`` and
+* ``voice`` — exactly one conversation per browser voice call, no rotation
+  (``start_call`` on connect, ``finish_call`` on hangup), plus ``callId`` and
   ``durationSec``. WhatsApp sessionisation never picks up a voice conversation.
 
 Derived fields (outcome, intents, doctorName, appointmentAt, escalation) are
@@ -46,7 +46,7 @@ IDLE_TIMEOUT = timedelta(minutes=30)
 CHANNEL = "whatsapp"
 VOICE_CHANNEL = "voice"
 # Text marker for a voice turn the agent opened (its greeting): no caller speech.
-CALL_STARTED = "[phone call started]"
+CALL_STARTED = "[voice call started]"
 
 # tool name → primaryIntent enum (closed set in the contract §4).
 _TOOL_INTENT = {
@@ -391,7 +391,7 @@ async def record_turn(
 # ---- voice calls (one conversation per call) ------------------------------
 
 
-def _start_call_sync(phone: str, call_sid: str, started_at: datetime) -> str:
+def _start_call_sync(phone: str, call_id: str, started_at: datetime) -> str:
     external_id = f"conv_{uuid.uuid4().hex}"
     ts = started_at.isoformat()
     get_db()[COLLECTION].insert_one(
@@ -399,7 +399,7 @@ def _start_call_sync(phone: str, call_sid: str, started_at: datetime) -> str:
             "externalId": external_id,
             "clinicId": settings.CLINIC_ID,
             "channel": VOICE_CHANNEL,
-            "callSid": call_sid,
+            "callId": call_id,
             "phone": _to_e164(phone) if phone else "",
             "patientName": _patient_name(phone) if phone else "Unknown",
             "startedAt": ts,
@@ -454,9 +454,9 @@ def _finish_call_sync(
     )
 
 
-async def start_call(phone: str, call_sid: str, started_at: datetime) -> str:
+async def start_call(phone: str, call_id: str, started_at: datetime) -> str:
     """Open the (single) ``active`` voice conversation for a call; return its id."""
-    return await asyncio.to_thread(_start_call_sync, phone, call_sid, started_at)
+    return await asyncio.to_thread(_start_call_sync, phone, call_id, started_at)
 
 
 async def finish_call(

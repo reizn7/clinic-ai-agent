@@ -44,7 +44,7 @@ def test_shared_core_rules_in_both() -> None:
 
 def test_voice_prompt_style() -> None:
     p = VOICE_SYSTEM_PROMPT
-    assert "live phone call" in p
+    assert "live voice call" in p
     assert "one moment, let me check" in p
     assert "spelling it back" in p
     assert "Hinglish" in p

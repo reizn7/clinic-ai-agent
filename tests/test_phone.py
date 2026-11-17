@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from clinic_agent.phone import normalize_phone, to_e164
+from clinic_agent.phone import is_valid_phone, normalize_phone, to_e164
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        # Exotel / E.164 forms
+        # E.164 forms, as typed on the call page
         ("+919876543210", "919876543210"),
         ("+91 98765 43210", "919876543210"),
         ("+91-98765-43210", "919876543210"),
         ("+14155550123", "14155550123"),
-        # trunk prefix 0 + 10 digits (common in Exotel `from`)
+        # trunk prefix 0 + 10 digits
         ("09876543210", "919876543210"),
         ("0 98765 43210", "919876543210"),
         # bare 10-digit national number
@@ -57,3 +57,45 @@ def test_to_e164() -> None:
 
 def test_round_trip() -> None:
     assert to_e164(normalize_phone("09876543210")) == "+919876543210"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "+91 98765 43210",
+        "+91-98765-43210",
+        "098765 43210",
+        "9876543210",
+        "919876543210",
+        "+91 (98765) 43210.",
+        "+14155550123",
+        "+44 20 7946 0958",
+        "00919876543210",
+    ],
+)
+def test_is_valid_phone(raw: str) -> None:
+    assert is_valid_phone(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "",
+        "   ",
+        "+",
+        "abc",
+        "12345",  # too short
+        "98765",
+        "+91 98765",  # Indian number with too few digits
+        "+91 98765 432100",  # ... or too many
+        "9876543210x",  # letters
+        "98765#43210",
+        "1+234567890",  # + not at the start
+        "++919876543210",
+        "+1234567890123456",  # longer than E.164 allows
+        "0000000000",
+    ],
+)
+def test_is_valid_phone_rejects(raw: str | None) -> None:
+    assert not is_valid_phone(raw)

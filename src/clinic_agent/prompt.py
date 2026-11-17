@@ -157,7 +157,7 @@ again later, just keep helping — no fresh greeting.""",
 
 
 VOICE_STYLE = ChannelStyle(
-    audience="answering the clinic's phone line on a live call.",
+    audience="answering a live voice call to the clinic.",
     tool_narration="""\
 On a call, silence feels broken: a brief "one moment, let me check" right before
    a tool call is fine. Never describe the result until the tool has returned it.""",
@@ -167,7 +167,7 @@ Once you have all six details, read them all back in one or two
   "So that's Ravi Kumar, 34, male, with Dr. Asha Mehta on Monday the 12th at 9:30 in
   the morning. Shall I book it?\"""",
     style="""\
-# This is a live phone call
+# This is a live voice call
 - Speak naturally, in short sentences. One idea at a time; never a long monologue.
 - No lists, bullets, markdown, symbols, or emoji — everything you say is spoken aloud.
 - Say dates and times the way people speak: "Monday the 16th at 10:30 in the
@@ -175,7 +175,7 @@ Once you have all six details, read them all back in one or two
 - Offer at most 2-3 slot or doctor options at a time, then ask which works.
 - Confirm the caller's name by spelling it back letter by letter ("That's R-A-V-I,
   Ravi Kumar, K-U-M-A-R?") before you use it in a booking.
-- The caller's phone number is already known from the call (it is in the Context).
+- The caller's phone number is already known (it is in the Context).
   Never ask for it, and never read it out unless they ask.
 - Reply in the caller's language — English, Hindi, or Hinglish — and stay
   consistent with it for the rest of the call.

@@ -1,13 +1,14 @@
-"""Bridge test: fake Exotel socket + fake ADK live runner yielding scripted events."""
+"""Bridge tests: fake call-page socket + fake ADK live runner yielding scripted events."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+import math
+import struct
 
 import mongomock
-import numpy as np
 import pytest
 from google.adk.events import Event
 from google.adk.sessions import InMemorySessionService
@@ -15,12 +16,11 @@ from google.genai import types
 from starlette.websockets import WebSocketDisconnect
 
 from clinic_agent.runtime import conversations, history
-from clinic_agent.voice import bridge, exotel
+from clinic_agent.voice import bridge, protocol
 
 AUTHOR = "clinic_receptionist"
-STREAM = "MZtest"
-CALL = "CAtest"
-CALLER_RAW = "09876543210"  # Exotel national format
+CALL = "call-test-1"
+CALLER_TYPED = "098765 43210"  # as typed on the page (trunk 0, spaces)
 PHONE = "919876543210"  # normalised
 
 BOOK_ARGS = {
@@ -36,33 +36,27 @@ BOOK_RESULT = {"success": True, "appointmentId": "appt1", "status": "Pending"}
 
 
 def _pcm(rate: int, seconds: float) -> bytes:
-    t = np.arange(int(rate * seconds)) / rate
-    return (np.sin(2 * np.pi * 300 * t) * 6000).astype("<i2").tobytes()
+    n = int(rate * seconds)
+    return struct.pack(f"<{n}h", *(int(6000 * math.sin(2 * math.pi * 300 * i / rate)) for i in range(n)))
 
 
-def _start_frame() -> str:
+GREETING_PCM = _pcm(24000, 0.25)  # 12000 bytes
+INTERRUPTED_PCM = _pcm(24000, 0.35)  # 16800 bytes: 3 full chunks + 2400 dropped
+REPLY_PCM = _pcm(24000, 0.15)  # 7200 bytes
+CHUNK = 4800  # 100 ms at 24 kHz
+
+
+def _start_frame(caller: str = CALLER_TYPED, transcripts: bool = True) -> str:
     return json.dumps(
-        {
-            "event": "start",
-            "sequence_number": "1",
-            "stream_sid": STREAM,
-            "start": {
-                "stream_sid": STREAM,
-                "call_sid": CALL,
-                "account_sid": "ACx",
-                "from": CALLER_RAW,
-                "to": "+918000000000",
-                "custom_parameters": {},
-                "media_format": {"encoding": "audio/x-raw", "sample_rate": "16000", "bit_rate": "16"},
-            },
-        }
+        {"event": "start", "call_id": CALL, "caller": caller, "transcripts": transcripts}
     )
 
 
 def _media_frame(pcm: bytes) -> str:
-    return json.dumps(
-        {"event": "media", "stream_sid": STREAM, "media": {"payload": base64.b64encode(pcm).decode()}}
-    )
+    return json.dumps({"event": "media", "payload": base64.b64encode(pcm).decode()})
+
+
+STOP = json.dumps({"event": "stop"})
 
 
 class FakeSocket:
@@ -98,11 +92,18 @@ class FakeRunner:
 
     app_name = "test-voice"
 
-    def __init__(self, script: list[Event], on_done=None, fail_after: int | None = None) -> None:
+    def __init__(
+        self,
+        script: list[Event],
+        on_done=None,
+        fail_after: int | None = None,
+        end_after_script: bool = False,
+    ) -> None:
         self.session_service = InMemorySessionService()
         self.script = script
         self.on_done = on_done
         self.fail_after = fail_after
+        self.end_after_script = end_after_script
         self.requests = []
         self.run_kwargs: dict = {}
 
@@ -127,24 +128,32 @@ class FakeRunner:
                 yield ev
             if self.on_done:
                 self.on_done()
+            if self.end_after_script:
+                return
             await asyncio.Event().wait()  # live sessions stay open until cancelled
         finally:
             drain.cancel()
 
 
-def _audio(seconds: float) -> Event:
+def _audio(pcm: bytes) -> Event:
     return Event(
         author=AUTHOR,
         partial=True,
         content=types.Content(
             role="model",
-            parts=[
-                types.Part(
-                    inline_data=types.Blob(data=_pcm(24000, seconds), mime_type="audio/pcm;rate=24000")
-                )
-            ],
+            parts=[types.Part(inline_data=types.Blob(data=pcm, mime_type="audio/pcm;rate=24000"))],
         ),
     )
+
+
+def _saying(delta: str) -> Event:
+    return Event(
+        author=AUTHOR, partial=True, output_transcription=types.Transcription(text=delta)
+    )
+
+
+def _hearing(delta: str) -> Event:
+    return Event(author=AUTHOR, partial=True, input_transcription=types.Transcription(text=delta))
 
 
 def _said(text: str) -> Event:
@@ -165,17 +174,24 @@ def _resp() -> Event:
     return Event(author=AUTHOR, content=types.Content(role="user", parts=[types.Part(function_response=fr)]))
 
 
+GREETING = "Hello, ABC Clinic, how can I help?"
+REQUEST = "Book me with Doctor Asha Monday 10:30, Ravi Kumar 34 male."
+BOOKED = "You're booked for Monday at 10:30."
+
 SCRIPT = [
-    _audio(0.25),
-    _said("Hello, ABC Clinic, how can I help?"),
+    _audio(GREETING_PCM),
+    _saying("Hello, ABC Clinic,"),
+    _saying(" how can I help?"),
+    _said(GREETING),
     Event(author=AUTHOR, turn_complete=True),
-    _heard("Book me with Doctor Asha Monday 10:30, Ravi Kumar 34 male."),
-    _audio(0.3),
+    _hearing("Book me"),
+    _heard(REQUEST),
+    _audio(INTERRUPTED_PCM),
     Event(author=AUTHOR, interrupted=True),
     _call(),
     _resp(),
-    _audio(0.15),
-    _said("You're booked for Monday at 10:30."),
+    _audio(REPLY_PCM),
+    _said(BOOKED),
     Event(author=AUTHOR, turn_complete=True),
 ]
 
@@ -190,23 +206,30 @@ def db(monkeypatch):
 
 async def _run(socket: FakeSocket, runner: FakeRunner) -> None:
     await asyncio.wait_for(
-        bridge.run_call(socket, sample_rate=16000, runner=runner, run_config=bridge.build_run_config()),
+        bridge.run_call(socket, runner=runner, run_config=bridge.build_run_config()),
         timeout=5,
     )
 
 
-async def test_full_call(db):
+def _full_call_socket(transcripts: bool = True) -> FakeSocket:
     inbound = _pcm(16000, 0.1)
-    socket = FakeSocket(
+    return FakeSocket(
         [
-            json.dumps({"event": "connected"}),
-            _start_frame(),
+            _start_frame(transcripts=transcripts),
             _media_frame(inbound),
             _media_frame(inbound),
             None,  # wait until the runner has played its script
-            json.dumps({"event": "stop", "stop": {"call_sid": CALL, "reason": "callended"}}),
+            STOP,
         ]
     )
+
+
+def _media(sent: list[dict]) -> list[bytes]:
+    return [base64.b64decode(m["payload"]) for m in sent if m["event"] == "media"]
+
+
+async def test_full_call(db):
+    socket = _full_call_socket()
     runner = FakeRunner(SCRIPT, on_done=socket.release.set)
     await _run(socket, runner)
 
@@ -219,33 +242,45 @@ async def test_full_call(db):
     blobs = [r.blob for r in runner.requests if r.blob]
     assert len(blobs) == 2
     assert all(b.mime_type == "audio/pcm;rate=16000" for b in blobs)
-    assert blobs[0].data == inbound  # 16 kHz in → passthrough
+    assert blobs[0].data == _pcm(16000, 0.1)  # forwarded untouched
     assert runner.run_kwargs["user_id"] == PHONE
     assert socket.closed
 
-    # --- downstream: Exotel media chunks + clear on barge-in ---
+    # --- downstream: ready first, native-rate media, clear on barge-in ---
+    assert socket.sent[0] == {"event": "ready", "input_rate": 16000, "output_rate": 24000}
     events = [m["event"] for m in socket.sent]
-    assert "clear" in events
-    assert all(m["stream_sid"] == STREAM for m in socket.sent)
-    media = [base64.b64decode(m["media"]["payload"]) for m in socket.sent if m["event"] == "media"]
-    assert media
-    assert all(len(p) % 320 == 0 and 3200 <= len(p) <= 100_000 for p in media)
+    assert events.count("ready") == 1
+    assert "end" not in events  # the caller hung up; the server didn't end it
     clear_at = events.index("clear")
-    assert "media" in events[:clear_at]  # greeting audio went out before the barge-in
-    assert "media" in events[clear_at + 1 :]  # and the post-booking reply after it
-    # Before the barge-in: greeting ~0.25 s → ~8000 bytes at 16 kHz, flushed (padded) on
-    # turn end to <= 9600, plus the full 3200-byte chunks of the 0.3 s clip (<= 9600)
-    # streamed before `interrupted`; its unsent remainder is dropped, not flushed.
-    before_clear = sum(len(p) for p in media[: events[:clear_at].count("media")])
-    assert 9600 < before_clear <= 19200
+    before = _media(socket.sent[:clear_at])
+    after = _media(socket.sent[clear_at + 1 :])
+    # Greeting: two 100 ms chunks + the 2400-byte tail flushed on turn_complete,
+    # passed through byte-for-byte at the model's 24 kHz.
+    assert [len(p) for p in before[:3]] == [CHUNK, CHUNK, 2400]
+    assert b"".join(before[:3]) == GREETING_PCM
+    # Interrupted clip: its 3 full chunks went out before `interrupted`; the
+    # unsent 2400-byte remainder is dropped, not flushed.
+    assert [len(p) for p in before[3:]] == [CHUNK] * 3
+    assert b"".join(after) == REPLY_PCM
+
+    # --- transcript frames: partials carry the line so far, then final ---
+    lines = [(m["role"], m["text"], m["final"]) for m in socket.sent if m["event"] == "transcript"]
+    assert lines == [
+        ("assistant", "Hello, ABC Clinic,", False),
+        ("assistant", GREETING, False),
+        ("assistant", GREETING, True),
+        ("user", "Book me", False),
+        ("user", REQUEST, True),
+        ("assistant", BOOKED, True),
+    ]
 
     # --- persisted: transcripts (normalised phone) ---
     msgs = db["transcripts"].find_one({"phone": PHONE})["messages"]
     assert [m["role"] for m in msgs] == ["user", "assistant", "user", "assistant"]
     assert msgs[0]["content"] == conversations.CALL_STARTED
-    assert msgs[1]["content"] == "Hello, ABC Clinic, how can I help?"
-    assert msgs[2]["content"].startswith("Book me with Doctor Asha")
-    assert msgs[3]["content"] == "You're booked for Monday at 10:30."
+    assert msgs[1]["content"] == GREETING
+    assert msgs[2]["content"] == REQUEST
+    assert msgs[3]["content"] == BOOKED
     assert msgs[3]["tools"] == [{"name": "book_appointment", "result": BOOK_RESULT}]
 
     # --- persisted: ONE voice conversation, finalized, derived fields ---
@@ -253,7 +288,7 @@ async def test_full_call(db):
     assert len(docs) == 1
     c = docs[0]
     assert c["channel"] == "voice"
-    assert c["callSid"] == CALL
+    assert c["callId"] == CALL
     assert c["phone"] == "+919876543210"
     assert c["status"] == "completed"
     assert c["outcome"] == "appointment_booked"
@@ -266,25 +301,103 @@ async def test_full_call(db):
     assert tool_msgs[0]["tool"]["args"] == BOOK_ARGS
 
 
-async def test_live_session_failure_still_persists(db):
+async def test_no_transcript_frames_unless_requested(db):
+    socket = _full_call_socket(transcripts=False)
+    runner = FakeRunner(SCRIPT, on_done=socket.release.set)
+    await _run(socket, runner)
+
+    events = [m["event"] for m in socket.sent]
+    assert "transcript" not in events
+    assert "clear" in events and "media" in events
+    # still recorded server-side
+    assert db["conversations"].find_one()["outcome"] == "appointment_booked"
+
+
+class FlakyTranscriptSocket(FakeSocket):
+    """Fails every transcript send; audio must be unaffected."""
+
+    async def send_text(self, data: str) -> None:
+        if json.loads(data)["event"] == "transcript":
+            raise RuntimeError("transcript send failed")
+        await super().send_text(data)
+
+
+async def test_transcript_send_failure_never_disrupts_audio(db):
+    inbound = _pcm(16000, 0.1)
+    socket = FlakyTranscriptSocket([_start_frame(), _media_frame(inbound), None, STOP])
+    runner = FakeRunner(SCRIPT, on_done=socket.release.set)
+    await _run(socket, runner)
+
+    events = [m["event"] for m in socket.sent]
+    assert "end" not in events
+    assert b"".join(_media(socket.sent[events.index("clear") + 1 :])) == REPLY_PCM
+    assert db["conversations"].find_one()["outcome"] == "appointment_booked"
+
+
+async def test_live_session_failure_ends_call_and_still_persists(db):
     socket = FakeSocket([_start_frame(), None])
-    runner = FakeRunner(SCRIPT, fail_after=3)  # greeting done, then the session dies
+    runner = FakeRunner(SCRIPT, fail_after=5)  # greeting done, then the session dies
     await _run(socket, runner)
 
     assert socket.closed
+    assert socket.sent[-1] == {"event": "end", "reason": "error"}
     c = db["conversations"].find_one()
     assert c["channel"] == "voice"
+    assert c["callId"] == CALL
     assert c["status"] == "abandoned"  # no tool succeeded
-    assert c["messages"][0]["content"] == "Hello, ABC Clinic, how can I help?"
+    assert c["messages"][0]["content"] == GREETING
     assert db["transcripts"].find_one({"phone": PHONE}) is not None
 
 
-async def test_socket_closes_before_start(db):
-    socket = FakeSocket([json.dumps({"event": "connected"})])
+async def test_live_session_ending_sends_end(db):
+    socket = FakeSocket([_start_frame(), None])
+    runner = FakeRunner(SCRIPT, end_after_script=True)
+    await _run(socket, runner)
+
+    assert socket.sent[-1] == {"event": "end", "reason": "session_ended"}
+    assert socket.closed
+    assert db["conversations"].find_one()["status"] == "completed"
+
+
+@pytest.mark.parametrize("caller", ["", "   ", "12345", "not a number", "+91 98765"])
+async def test_invalid_caller_is_rejected(db, caller):
+    socket = FakeSocket([_start_frame(caller=caller), None])
     runner = FakeRunner(SCRIPT)
     await _run(socket, runner)
+
+    assert socket.sent == [{"event": "end", "reason": "invalid_caller"}]
+    assert socket.closed
+    assert runner.requests == []  # no live session
+    assert runner.run_kwargs == {}
+    assert db["conversations"].count_documents({}) == 0
+    assert db["transcripts"].count_documents({}) == 0
+
+
+async def test_missing_caller_is_rejected(db):
+    socket = FakeSocket([json.dumps({"event": "start", "call_id": CALL}), None])
+    runner = FakeRunner(SCRIPT)
+    await _run(socket, runner)
+    assert socket.sent == [{"event": "end", "reason": "invalid_caller"}]
+    assert db["conversations"].count_documents({}) == 0
+
+
+async def test_socket_closes_before_start(db):
+    socket = FakeSocket(["not json", json.dumps({"event": "media", "payload": ""})])
+    runner = FakeRunner(SCRIPT)
+    await _run(socket, runner)
+    assert socket.sent == []
     assert db["conversations"].count_documents({}) == 0
     assert runner.requests == []
+
+
+async def test_no_start_times_out(db, monkeypatch):
+    monkeypatch.setattr(bridge, "START_TIMEOUT_SECONDS", 0.05)
+    socket = FakeSocket([None])  # never sends start
+    runner = FakeRunner(SCRIPT)
+    await _run(socket, runner)
+    assert socket.sent == [{"event": "end", "reason": protocol.END_NO_START}]
+    assert socket.closed
+    assert db["conversations"].count_documents({}) == 0
 
 
 def test_call_transcript_grouping():
@@ -301,47 +414,3 @@ def test_call_transcript_grouping():
         ("Asha", ""),
     ]
     assert t.turns[1]["tools"] == [{"name": "list_doctors"}]
-
-
-def test_exotel_helpers(monkeypatch):
-    monkeypatch.setattr(exotel.settings, "VOICE_WS_TOKEN", "")
-    assert exotel.token_ok(None)
-    monkeypatch.setattr(exotel.settings, "VOICE_WS_TOKEN", "s3cret")
-    assert exotel.token_ok("s3cret")
-    assert not exotel.token_ok("nope")
-    assert not exotel.token_ok(None)
-
-    monkeypatch.setattr(exotel.settings, "VOICE_SAMPLE_RATE", 16000)
-    assert exotel.requested_rate("8000") == 8000
-    assert exotel.requested_rate("24000") == 24000
-    assert exotel.requested_rate("44100") == 16000
-    assert exotel.requested_rate(None) == 16000
-    assert exotel.requested_rate("abc") == 16000
-
-
-def test_exotel_route_token_and_rate(monkeypatch):
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    seen = {}
-
-    async def fake_run_call(ws, *, sample_rate):
-        seen["rate"] = sample_rate
-        await ws.send_text("ok")
-        await ws.close()
-
-    monkeypatch.setattr(exotel, "run_call", fake_run_call)
-    monkeypatch.setattr(exotel.settings, "VOICE_WS_TOKEN", "s3cret")
-    app = FastAPI()
-    app.include_router(exotel.router)
-    client = TestClient(app)
-
-    with (
-        pytest.raises(WebSocketDisconnect),
-        client.websocket_connect("/voice/exotel?token=wrong") as ws,
-    ):
-        ws.receive_text()
-
-    with client.websocket_connect("/voice/exotel?token=s3cret&sample-rate=8000") as ws:
-        assert ws.receive_text() == "ok"
-    assert seen["rate"] == 8000
