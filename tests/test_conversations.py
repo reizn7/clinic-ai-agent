@@ -66,6 +66,13 @@ def test_derive_intents_ordered_unique():
     assert conv.derive_intents(calls) == ["clinic_info", "book_appointment"]
 
 
+def test_primary_intent_prefers_goal_over_lookup():
+    # Lookups first, booking last: the call is still a booking.
+    assert conv.derive_primary_intent([INFO_OK, BOOK_OK]) == "book_appointment"
+    assert conv.derive_primary_intent([INFO_OK]) == "clinic_info"
+    assert conv.derive_primary_intent([]) == "other"
+
+
 def test_escalation_reason():
     assert conv.escalation_reason([ESCALATE_OK]) == "billing"
     assert conv.escalation_reason([BOOK_OK]) is None

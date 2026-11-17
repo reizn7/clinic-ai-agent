@@ -109,6 +109,25 @@ def derive_intents(calls: list[dict]) -> list[str]:
     return seen
 
 
+# Most goal-like first. A booking call usually opens with list_doctors /
+# check_availability, so "first tool called" would label it clinic_info and
+# hide it from the console's booking-completion KPI.
+_INTENT_PRIORITY = (
+    "reschedule_appointment",
+    "cancel_appointment",
+    "book_appointment",
+    "doctor_availability",
+    "clinic_info",
+    "other",
+)
+
+
+def derive_primary_intent(calls: list[dict]) -> str:
+    """The patient's main goal: the highest-priority intent attempted (success or not)."""
+    intents = set(derive_intents(calls))
+    return next((i for i in _INTENT_PRIORITY if i in intents), "other")
+
+
 def escalation_reason(calls: list[dict]) -> str | None:
     for c in calls:
         if c.get("name") == "escalate_to_human" and c.get("status") == "success":
@@ -207,7 +226,7 @@ def _derived_fields(all_calls: list[dict]) -> dict[str, Any]:
     """Console fields recomputed from every tool call in a conversation."""
     return {
         "outcome": derive_outcome(all_calls),
-        "primaryIntent": (derive_intents(all_calls) or ["other"])[0],
+        "primaryIntent": derive_primary_intent(all_calls),
         "intents": derive_intents(all_calls),
         "doctorName": _doctor_name(all_calls),
         "appointmentAt": _appointment_at(all_calls),

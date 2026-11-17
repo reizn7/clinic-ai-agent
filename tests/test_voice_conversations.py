@@ -73,7 +73,7 @@ async def test_finish_call_writes_turns_and_derived_fields(db):
     doc = docs[0]
     assert doc["status"] == "completed"
     assert doc["outcome"] == "appointment_booked"
-    assert doc["primaryIntent"] == "doctor_availability"
+    assert doc["primaryIntent"] == "book_appointment"
     assert doc["intents"] == ["doctor_availability", "book_appointment"]
     assert doc["doctorName"] == "Asha Mehta"
     assert doc["appointmentAt"] == "2026-11-16T10:30:00"
