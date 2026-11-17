@@ -67,6 +67,28 @@ def _append_turn_sync(
     )
 
 
+def _append_messages_sync(phone: str, messages: list[dict]) -> None:
+    now = datetime.now(UTC)
+    get_db()[_COLLECTION].update_one(
+        _key(phone),
+        {
+            "$push": {"messages": {"$each": [{**m, "ts": now} for m in messages]}},
+            "$set": {"updatedAt": now},
+            "$setOnInsert": {"phone": phone, "clinicId": settings.CLINIC_ID, "createdAt": now},
+        },
+        upsert=True,
+    )
+
+
+async def append_messages(phone: str, messages: list[dict]) -> None:
+    """Append loose ``{role, content}`` messages (patient ``user`` or ``staff``).
+
+    Used while staff handle a chat, so the AI has the whole exchange in context
+    when the chat is handed back.
+    """
+    await asyncio.to_thread(_append_messages_sync, phone, messages)
+
+
 async def get_history(phone: str) -> list[dict]:
     """Return the most recent prior messages for a phone (oldest → newest)."""
     return await asyncio.to_thread(_get_history_sync, phone)

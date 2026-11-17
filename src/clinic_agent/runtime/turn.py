@@ -25,7 +25,7 @@ from clinic_agent.runtime.tool_capture import ToolCallRecorder
 from clinic_agent.runtime.tool_capture import (  # noqa: F401  (re-exported; tests import it)
     looks_like_error as _looks_like_error,
 )
-from clinic_agent.tools.booking_tools import CALLER_PHONE, CHANNEL
+from clinic_agent.tools.booking_tools import CALLER_PHONE, CHANNEL, CONVERSATION_ID
 
 log = logging.getLogger("clinic_agent.runtime.turn")
 
@@ -71,6 +71,10 @@ def contextualize(
     for turn in history:
         if turn.get("role") == "user":
             lines.append(f"Patient: {turn.get('content', '')}")
+            continue
+        if turn.get("role") == "staff":
+            # Written by a person at the clinic while they handled the chat.
+            lines.append(f"Clinic staff: {turn.get('content', '')}")
             continue
         line = f"Assistant: {turn.get('content', '')}"
         tools = turn.get("tools")
@@ -151,7 +155,7 @@ async def _run_turn(
         app_name=APP_NAME,
         user_id=adk_user,
         session_id=session_id,
-        state={CALLER_PHONE: phone, CHANNEL: "whatsapp"},
+        state={CALLER_PHONE: phone, CHANNEL: "whatsapp", CONVERSATION_ID: conversation_id},
     )
 
     new_message = types.Content(role="user", parts=[types.Part.from_text(text=seeded)])

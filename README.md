@@ -380,24 +380,33 @@ slow or failing Google/Meta call never blocks the conversation.
   (calendar not shared, WhatsApp rejection) fail at once with a readable `lastError`.
 - Outcomes are written onto the appointment (`calendarSync`, `confirmation`) for the
   console, and each job is a Langfuse trace (`sync-doctor-calendar`,
-  `send-appointment-confirmation`, `alert-staff-handoff`).
-- `staff.alert` (not tied to an appointment) is the human handoff; see below.
+  `send-appointment-confirmation`, `send-staff-reply`).
+- `staff.reply` (not tied to an appointment) is a staff member's WhatsApp reply,
+  inserted by the console; see below.
 
 ### `runtime/escalation.py` (human handoff)
-When `escalate_to_human` runs, `request_handoff` queues one `staff.alert` outbox job
-per recipient: every **active** row on the console's **Staff** page (`records`,
-`entityType: "staff"`) with `receivesEscalations: true` and a valid `phone`. The
-worker WhatsApps each of them the patient's name (if known), number, channel, reason
-and time; it never waits for the conversation to end. Facts:
-- Staff numbers are read only here. The Staff page isn't `agentEnabled` and its
-  fields aren't agent-visible, so the model never sees them.
-- A second request from the same patient within 30 minutes doesn't re-alert; the
-  tool returns `already_alerted: true` and the agent says the team already knows.
-- Meta only delivers free text to a number that messaged the clinic in the last 24 h.
-  For reliable alerts, approve a template and set `WHATSAPP_TEMPLATE_ESCALATION`
-  (params: patient name, patient phone, channel, reason, clinic name).
-- No recipients configured: the conversation is still flagged `escalated` for the
-  console queue, and a warning is logged.
+The contract is `docs/staff-handoff-contract.md` in the console repo
+(`receptionist-agent-platform`). No alerts go to staff phones; staff work the
+console's **Escalations** page.
+- `escalate_to_human` inserts one `escalations` doc (`status: "open"`, patient name
+  and E.164 phone, channel, reason, `conversationId`). At most one unresolved
+  escalation per conversation: asking again returns it with `already_requested: true`.
+- **WhatsApp:** the turn that escalates sets the conversation's
+  `handledBy: "staff"` (plus `escalationId`, `escalatedAt`). From then on the AI
+  doesn't reply. `capture_for_staff` (called by the flusher and the non-debounced
+  webhook path) appends the patient's messages to the conversation and to prompt
+  history instead. A staff-handled chat is never closed or rotated for being idle.
+- Staff reply from the console, which pushes a `role: "staff"` message
+  (`delivery.status: "pending"`) and a `staff.reply` outbox job. `send_staff_reply`
+  sends it to the conversation's phone and sets `delivery` to `sent` (with
+  `waMessageId`) or `failed` (WhatsApp 4xx such as a closed 24 h window fails at
+  once; other errors retry, and the message is marked failed when retries run out).
+  The reply is also added to prompt history as `Clinic staff: …`, so the AI knows
+  what was said when the chat comes back.
+- Resolving the escalation in the console sets `handledBy: "agent"`, and the AI
+  answers the next message.
+- **Voice:** the escalation record carries the number to call back; the call's
+  conversation gets `escalationId` / `escalatedAt` on hangup.
 
 ### `tools/repo.py`
 Synchronous Mongo data access, ported from v1's Mongoose services. Key behaviours:
@@ -509,7 +518,7 @@ interface. Each tool runs the corresponding sync `repo` function via `asyncio.to
 | `reschedule_appointment` | `appointment_id, new_date, new_slot` | like `book_appointment` |
 | `cancel_appointment` | `appointment_id` | `{success, appointmentId, status}` or `{success: false, error}` |
 | `search_catalog` | `catalog, query?` | `{catalog, label, query, total_matches, results: [{name, <field label>: value…}]}` or `{error, available_catalogs}` |
-| `escalate_to_human` | `reason` | `{escalated: true, message, staff_alerted, already_alerted}`: queues WhatsApp alerts to staff opted in on the Staff page |
+| `escalate_to_human` | `reason` | `{escalated: true, message, escalation_id, already_requested}`: opens an escalation on the console; on WhatsApp, staff take over the chat |
 
 Formats: `date` = `YYYY-MM-DD`, `slot` = `HH:mm`, `doctor_name` without the "Dr." prefix.
 **Error convention:** a result with an `error` key or `success: false` is treated as a
@@ -575,7 +584,8 @@ so one database can hold several clinics.
 | `records` | `{clinicId, entityType, isActive, attributes}`: rows of custom pages (lab tests, services, …) | `(clinicId, entityType, isActive)` |
 | `appointments` | `{patientId, doctorId, date "YYYY-MM-DD", slot "HH:mm", status, createdAt, updatedAt, cancelledAt?}` | **unique partial `(doctorId, date, slot)`** where `status ∈ {Pending, Confirmed, Arrived, Completed}` |
 | `transcripts` | per phone, see `history.py` | – |
-| `conversations` | per conversation, see `conversations.py`. `channel` is `whatsapp` or `voice`; voice docs add `callId` and `durationSec`. `phone` is E.164 (`+` prefixed), timestamps are ISO-8601 UTC strings | unique `externalId`; `(clinicId, startedAt)`, `(clinicId, outcome, startedAt)`, `(clinicId, escalated, startedAt)`, `(phone, startedAt)` |
+| `conversations` | per conversation, see `conversations.py`. `channel` is `whatsapp` or `voice`; voice docs add `callId` and `durationSec`. Handoff fields: `handledBy` (`agent`/`staff`), `escalationId`, `escalatedAt`, `lastPatientMessageAt`; staff messages have `role: "staff"` and `delivery`. `phone` is E.164 (`+` prefixed), timestamps are ISO-8601 UTC strings | unique `externalId`; `(clinicId, startedAt)`, `(clinicId, outcome, startedAt)`, `(clinicId, escalated, startedAt)`, `(phone, startedAt)` |
+| `escalations` | one per request for a human (see `runtime/escalation.py`); the agent inserts `open`, the console claims and resolves | `(clinicId, status, createdAt)`, `(clinicId, conversationId, status)` |
 | `pending_messages` | `{clinicId, phone, messages[], deadline, firstAt}` (ISO strings) | unique `(clinicId, phone)`; `deadline` |
 
 Appointment statuses: `Pending` (all agent bookings), `Confirmed`, `Arrived`,
@@ -650,8 +660,6 @@ Copy `.env.example` to `.env`. All settings live in
 | `VOICE_MODEL` | `gemini-3.8-live` | Gemini Live native-audio model for voice calls (must support function calling) |
 | `VOICE_NAME` | `""` | Optional prebuilt voice (e.g. `Kore`, `Puck`); empty means the model default |
 | `VOICE_WS_TOKEN` | `""` | Optional shared secret; if set, open the page as `/voice/call?token=<value>` (the page passes it to the WebSocket) |
-| `STAFF_ALERTS_ENABLED` | `true` | WhatsApp-alert opted-in staff (Staff page) when a patient asks for a human |
-| `WHATSAPP_TEMPLATE_ESCALATION` | `""` | Approved template for staff alerts outside the 24 h window; empty = plain text |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `PORT` | `3000` | HTTP port |
 
@@ -853,10 +861,10 @@ Keep these true when changing the code:
 - **No ownership check on cancel/reschedule:** these tools act on any
   `appointment_id`. The agent obtains ids via `list_my_appointments(phone)`, but the
   repo does not verify that the appointment belongs to the caller.
-- **Handoff is an alert, not a live takeover.** `escalate_to_human` WhatsApps opted-in
-  staff, but the bot keeps answering the WhatsApp chat; staff reply or call back
-  separately. Without `WHATSAPP_TEMPLATE_ESCALATION`, alerts only reach staff who
-  messaged the clinic number in the last 24 h.
+- **Staff replies are free text only.** WhatsApp delivers them only within 24 h of
+  the patient's last message; the console disables the reply box after that. A
+  staff-handled chat stays silent until someone resolves its escalation (there is no
+  automatic timeout).
 - **Timezone:** "today", past-date checks, and `appointmentAt` use the **server's
   local time**, with no clinic timezone configured. Deploy with the clinic's TZ or add
   one.

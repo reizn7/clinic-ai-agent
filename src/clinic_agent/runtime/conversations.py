@@ -32,6 +32,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from bson import ObjectId
 from pymongo import ReturnDocument
 
 from clinic_agent import observability
@@ -48,6 +49,10 @@ CHANNEL = "whatsapp"
 VOICE_CHANNEL = "voice"
 # Text marker for a voice turn the agent opened (its greeting): no caller speech.
 CALL_STARTED = "[voice call started]"
+
+# Human handoff (contract: console repo, docs/staff-handoff-contract.md).
+ESCALATIONS = "escalations"
+HANDLED_BY_STAFF = "staff"
 
 # tool name → primaryIntent enum (closed set in the contract §4).
 _TOOL_INTENT = {
@@ -278,6 +283,25 @@ def _score_conversation(external_id: str, calls: list[dict]) -> None:
         observability.score_session(external_id, **s)
 
 
+def _escalation_fields(calls: list[dict], at: str) -> dict[str, Any]:
+    """``escalationId`` / ``escalatedAt`` if ``calls`` escalated, else ``{}``."""
+    for c in reversed(calls):
+        if c.get("name") == "escalate_to_human" and c.get("status") == "success":
+            escalation_id = (c.get("result") or {}).get("escalation_id")
+            return {"escalatedAt": at, **({"escalationId": escalation_id} if escalation_id else {})}
+    return {}
+
+
+def _link_escalation(escalation_id: str | None, conversation_id: str) -> None:
+    """Point an escalation at its conversation (unknown when the tool ran)."""
+    if not escalation_id or not ObjectId.is_valid(escalation_id):
+        return
+    get_db()[ESCALATIONS].update_one(
+        {"_id": ObjectId(escalation_id), "clinicId": settings.CLINIC_ID, "conversationId": None},
+        {"$set": {"conversationId": conversation_id, "updatedAt": datetime.now(UTC).isoformat()}},
+    )
+
+
 def _patient_name(phone: str) -> str:
     doc = get_db()["patients"].find_one(
         {"clinicId": settings.CLINIC_ID, "phone": phone}, {"name": 1}
@@ -306,7 +330,13 @@ def close_idle_active(idle_cutoff_iso: str) -> int:
     """
     col = get_db()[COLLECTION]
     closed = 0
-    query = {"clinicId": settings.CLINIC_ID, "status": "active", "endedAt": {"$lt": idle_cutoff_iso}}
+    query = {
+        "clinicId": settings.CLINIC_ID,
+        "status": "active",
+        "endedAt": {"$lt": idle_cutoff_iso},
+        # A chat staff are handling stays open however long they take.
+        "handledBy": {"$ne": HANDLED_BY_STAFF},
+    }
     for conv in col.find(query):
         calls = _calls_from_messages(conv.get("messages", []))
         col.update_one({"externalId": conv["externalId"]}, {"$set": {"status": _final_status(calls)}})
@@ -377,7 +407,13 @@ def _new_conversation_id() -> str:
 
 
 def _is_stale(conv: dict, now: datetime) -> bool:
-    """True once the idle window has elapsed since the conversation's last message."""
+    """True once the idle window has elapsed since the conversation's last message.
+
+    Never for a chat staff are handling: it stays one conversation until they
+    hand it back.
+    """
+    if conv.get("handledBy") == HANDLED_BY_STAFF:
+        return False
     msgs = conv.get("messages", [])
     if not msgs:
         return False
@@ -465,6 +501,11 @@ def _record_turn_sync(
 
     all_calls = _calls_from_messages(conv.get("messages", [])) + tool_calls
     turn_messages = _build_turn_messages(patient_text, agent_reply, tool_calls, latency_ms, now)
+    # Escalating hands the chat to staff: the AI stays quiet until they hand it back.
+    handoff = _escalation_fields(tool_calls, now.isoformat())
+    if handoff:
+        handoff["handledBy"] = HANDLED_BY_STAFF
+        _link_escalation(handoff.get("escalationId"), conv["externalId"])
 
     col.update_one(
         {"externalId": conv["externalId"]},
@@ -472,14 +513,54 @@ def _record_turn_sync(
             "$push": {"messages": {"$each": turn_messages}},
             "$set": {
                 "endedAt": now.isoformat(),
+                "lastPatientMessageAt": now.isoformat(),
                 "patientName": _patient_name(phone),
                 **_derived_fields(all_calls),
+                **handoff,
                 # Stay OPEN through escalation — the `escalated` flag drives the
                 # console follow-up queue; the final "escalated" status is set
                 # when the sweeper closes the conversation on idle. This keeps a
                 # continued chat in ONE conversation instead of splitting it.
                 "status": "active",
             },
+        },
+    )
+    return conv["externalId"]
+
+
+def record_staff_handled_messages(phone: str, texts: list[str]) -> str | None:
+    """Append patient messages to the chat staff are handling; its id, or None.
+
+    None (nothing written) when this phone has no open chat with staff, so the
+    caller runs a normal AI turn instead.
+    """
+    col = get_db()[COLLECTION]
+    conv = col.find_one(
+        {
+            "clinicId": settings.CLINIC_ID,
+            "phone": _to_e164(phone),
+            "status": "active",
+            "channel": {"$ne": VOICE_CHANNEL},
+            "handledBy": HANDLED_BY_STAFF,
+        },
+        {"externalId": 1},
+        sort=[("startedAt", -1)],
+    )
+    if not conv:
+        return None
+    ts = datetime.now(UTC).isoformat()
+    col.update_one(
+        {"externalId": conv["externalId"]},
+        {
+            "$push": {
+                "messages": {
+                    "$each": [
+                        {"role": "patient", "type": "text", "content": t, "timestamp": ts}
+                        for t in texts
+                    ]
+                }
+            },
+            "$set": {"endedAt": ts, "lastPatientMessageAt": ts},
         },
     )
     return conv["externalId"]
@@ -561,6 +642,7 @@ def _finish_call_sync(
                 "durationSec": max(0, round((ended_at - started_at).total_seconds())),
                 "patientName": _patient_name(phone) if phone else "Unknown",
                 **_derived_fields(all_calls),
+                **_escalation_fields(all_calls, ended_at.isoformat()),
                 # Finalized on hangup — immediately eligible for analytics.
                 "status": _final_status(all_calls),
             },

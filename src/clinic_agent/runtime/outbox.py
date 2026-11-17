@@ -1,4 +1,4 @@
-"""Outbox: follow-up jobs (calendar sync, WhatsApp confirmations, staff handoff alerts).
+"""Outbox: follow-up jobs (calendar sync, WhatsApp confirmations, staff replies).
 
 A booking tool writes the appointment and, in the same breath, queues jobs here.
 The worker (``run_forever``, started in the app lifespan) delivers them, so a slow
@@ -48,14 +48,15 @@ _BATCH = 20
 
 CALENDAR_SYNC = "calendar.sync"
 WHATSAPP_NOTIFY = "whatsapp.notify"
-STAFF_ALERT = "staff.alert"  # a patient asked for a human (runtime.escalation)
+# Inserted by the staff console: a staff member's WhatsApp reply (runtime.escalation).
+STAFF_REPLY = "staff.reply"
 
 _UNSENT = ["held", "pending"]
 # Langfuse trace names (stable, verb-first: dashboards filter on them).
 _TRACE_NAMES = {
     CALENDAR_SYNC: "sync-doctor-calendar",
     WHATSAPP_NOTIFY: "send-appointment-confirmation",
-    STAFF_ALERT: "alert-staff-handoff",
+    STAFF_REPLY: "send-staff-reply",
 }
 
 _hold: contextvars.ContextVar[str | None] = contextvars.ContextVar("outbox_hold", default=None)
@@ -98,9 +99,6 @@ def ensure_indexes() -> None:
     col = get_db()[COLLECTION]
     create_index_safe(col, [("clinicId", 1), ("status", 1), ("nextAttemptAt", 1)], name="due")
     create_index_safe(col, [("appointmentId", 1), ("kind", 1), ("status", 1)], name="by_appt")
-    create_index_safe(
-        col, [("clinicId", 1), ("kind", 1), ("patientPhone", 1), ("createdAt", -1)], name="by_alert"
-    )
 
 
 def _now() -> str:
@@ -177,16 +175,11 @@ def _enqueue(appointment_id: ObjectId, event: str) -> None:
     )
 
 
-def enqueue_staff_alert(**fields: Any) -> None:
-    """Queue one staff handoff alert (never held: staff should know right away)."""
-    get_db()[COLLECTION].insert_one(_job(STAFF_ALERT, None, status="pending", **fields))
-
-
 def _subject(job: dict) -> str:
     """What a job is about, for logs and traces."""
     if job.get("appointmentId") is not None:
         return str(job["appointmentId"])
-    return str(job.get("staffName") or job["_id"])
+    return str(job.get("conversationId") or job["_id"])
 
 
 # ---- worker -----------------------------------------------------------------------

@@ -13,7 +13,7 @@ import logging
 import uuid
 
 from clinic_agent.config import settings
-from clinic_agent.runtime import debounce, outbox
+from clinic_agent.runtime import debounce, escalation, outbox
 from clinic_agent.runtime.turn import run_turn
 from clinic_agent.whatsapp.client import send_text_message
 
@@ -23,6 +23,8 @@ log = logging.getLogger("clinic_agent.runtime.flusher")
 async def _flush_one(phone: str, messages: list[str]) -> None:
     combined = "\n".join(messages)
     try:
+        if await escalation.capture_for_staff(phone, messages):
+            return  # staff are handling this chat: no AI reply
         # Booking confirmations queued during the turn go out after the reply.
         with outbox.held(f"wa:{uuid.uuid4().hex}"):
             reply = await run_turn(phone, combined, bubbles=len(messages))

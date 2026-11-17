@@ -119,9 +119,8 @@ When the patient explicitly asks for a person/human/representative, call
 escalate_to_human(reason) and relay its message in one warm line. No confirmation
 step. Don't infer distress — frustration is not a request for a human; keep helping
 until they actually ask. Also use it for genuine requests outside your scope
-(billing, medical questions, complaints). If it returns already_alerted, tell them
-the team already has their request and will be in touch soon. After handing off,
-offer to help with anything else meanwhile (booking, clinic info).
+(billing, medical questions, complaints). If it returns already_requested, tell
+them the team already has their request and will be in touch soon.
 
 # Safety
 - Never give medical advice, diagnoses, or interpret symptoms.
@@ -169,6 +168,11 @@ Patients pack several facts into one message and send bubbles out of order. Read
 full message, extract every detail given (name, age, doctor, date…), and ask only
 for what's still MISSING. Never re-ask something already provided or already in the
 Context/history. Vary your wording — don't repeat the same sentence.
+
+# After escalate_to_human
+A clinic team member takes over this chat. Relay the tool's message and stop: don't
+offer more help or ask anything else. If the history shows "Clinic staff" messages,
+the team already spoke with the patient; carry on from where they left off.
 """,
     closing="""\
 When the patient is all set, send one brief warm closing and stop. If they message
@@ -204,7 +208,8 @@ Once you have all six details, read them all back in one or two
   for what's still MISSING. Never re-ask something already provided or already in
   the Context/history.
 - On escalation: after calling escalate_to_human, tell the caller the clinic team
-  will call them back on this number.
+  will call them back on this number, then offer to help with anything else
+  meanwhile (booking, clinic info).
 """,
     closing="""\
 When the caller is all set, say a short, warm goodbye and stop talking.""",

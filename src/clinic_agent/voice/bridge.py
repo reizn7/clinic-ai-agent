@@ -51,7 +51,7 @@ from clinic_agent.runtime.agent import build_agent
 from clinic_agent.runtime.history import append_turn
 from clinic_agent.runtime.tool_capture import ToolCallRecorder
 from clinic_agent.runtime.turn import contextualize
-from clinic_agent.tools.booking_tools import CALLER_PHONE, CHANNEL
+from clinic_agent.tools.booking_tools import CALLER_PHONE, CHANNEL, CONVERSATION_ID
 from clinic_agent.voice import audio, protocol
 from clinic_agent.voice.call_trace import CallTracer
 
@@ -242,7 +242,7 @@ class CallBridge:
                 app_name=self.runner.app_name,
                 user_id=self.user_id,
                 session_id=self.session_id,
-                state={CALLER_PHONE: self.phone, CHANNEL: "voice"},
+                state={CALLER_PHONE: self.phone, CHANNEL: "voice", CONVERSATION_ID: self.conv_id},
             )
             seeded = contextualize(GREETING_CUE, [], self.phone, channel="voice")
             self.queue.send_content(types.Content(role="user", parts=[types.Part(text=seeded)]))

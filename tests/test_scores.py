@@ -186,14 +186,14 @@ def test_sweeper_close_scores_conversation(db, sent):
 
 
 def test_idle_rotation_scores_previous_conversation(db, sent):
-    conv._record_turn_sync("919", "hi", "hello", [ESCALATE_OK], 100)
+    conv._record_turn_sync("919", "book", "Booked!", [BOOK_OK], 100)
     doc = db["conversations"].find_one({"phone": "+919"})
     doc["messages"][-1]["timestamp"] = _ago(45)
     db["conversations"].update_one(
         {"externalId": doc["externalId"]}, {"$set": {"messages": doc["messages"]}}
     )
     conv._record_turn_sync("919", "back", "welcome back", [], 100)
-    assert (doc["externalId"], "escalated", 1) in sent
+    assert (doc["externalId"], "booking_succeeded", 1) in sent
     assert {sid for sid, _, _ in sent} == {doc["externalId"]}  # new one not scored yet
 
 

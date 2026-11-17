@@ -33,6 +33,7 @@ log = logging.getLogger("clinic_agent.tools")
 # ADK session-state keys, set by the harness (runtime.turn / voice.bridge).
 CALLER_PHONE = "caller_phone"
 CHANNEL = "channel"
+CONVERSATION_ID = "conversation_id"  # conversations.externalId, when known
 # Set by the tools themselves during a voice call.
 VERIFIED = "caller_verified"
 VERIFY_ATTEMPTS = "verify_attempts"
@@ -250,7 +251,8 @@ async def search_catalog(catalog: str, query: str = "") -> dict:
 async def escalate_to_human(reason: str, tool_context: ToolContext) -> dict:
     """Hand off to the clinic's human team when the patient asks for a human or
     has a request outside your scope (billing disputes, medical questions,
-    complaints). Staff are alerted on WhatsApp with the patient's number.
+    complaints). Staff see the request in the clinic console. On WhatsApp they
+    take over this chat; on a call they phone the patient back.
 
     Args:
         reason: A short description of why a human is needed.
@@ -258,18 +260,21 @@ async def escalate_to_human(reason: str, tool_context: ToolContext) -> dict:
     log.info("Escalation requested: %s", reason)
     phone = _caller(tool_context)
     channel = str(tool_context.state.get(CHANNEL) or "whatsapp")
+    conversation_id = tool_context.state.get(CONVERSATION_ID) or None
     try:
-        handoff = await asyncio.to_thread(escalation.request_handoff, phone, channel, reason)
+        handoff = await asyncio.to_thread(
+            escalation.request_handoff, phone, channel, reason, conversation_id
+        )
     except Exception:
-        # The conversation is still flagged for the console queue; never fail the turn.
-        log.exception("could not queue staff alert for a handoff")
-        handoff = {"staff_alerted": 0, "already_alerted": False}
+        # The conversation is still flagged `escalated`; never fail the turn.
+        log.exception("could not open an escalation")
+        handoff = {"escalation_id": None, "already_requested": False}
     if channel == "voice":
         message = (
             "I've let our clinic team know. Someone will call you back on this number shortly."
         )
     else:
-        message = "I've let our clinic team know. Someone will reply to you here shortly."
+        message = "I've passed this chat to our clinic team. A team member will reply to you here."
     return {"escalated": True, "message": message, **handoff}
 
 

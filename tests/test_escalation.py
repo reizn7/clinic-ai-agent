@@ -1,4 +1,4 @@
-"""Human handoff: staff recipients, alert queuing/dedupe, the WhatsApp alert, the tool."""
+"""Human handoff: escalation records, staff-handled chats, staff replies, the tool."""
 
 from __future__ import annotations
 
@@ -8,39 +8,200 @@ import httpx
 import pytest
 
 from clinic_agent.config import settings
-from clinic_agent.runtime import escalation, followups, outbox
-from clinic_agent.tools import catalog
-from clinic_agent.tools.booking_tools import CALLER_PHONE, CHANNEL, escalate_to_human
+from clinic_agent.runtime import conversations, escalation, flusher, followups, history, outbox
+from clinic_agent.tools.booking_tools import (
+    CALLER_PHONE,
+    CHANNEL,
+    CONVERSATION_ID,
+    escalate_to_human,
+)
 
 PATIENT = "919811122233"
 
 
-def _staff(db, name, phone, *, alerts=True, active=True):
-    db[catalog.RECORDS].insert_one(
+@pytest.fixture
+def db(_no_real_mongo):
+    fake = _no_real_mongo
+    fake["patients"].insert_one(
+        {"clinicId": settings.CLINIC_ID, "phone": PATIENT, "name": "Ravi Kumar"}
+    )
+    return fake
+
+
+def _escalations(db):
+    return list(db[escalation.COLLECTION].find())
+
+
+def _escalate_call(escalation_id: str) -> dict:
+    return {
+        "name": "escalate_to_human",
+        "args": {"reason": "billing"},
+        "result": {"escalated": True, "escalation_id": escalation_id},
+        "status": "success",
+    }
+
+
+def _staff_chat(db) -> tuple[str, str]:
+    """A WhatsApp chat whose turn escalated → (conversation id, escalation id)."""
+    conv_id = conversations._resolve_conversation_id_sync(PATIENT)
+    esc = escalation.request_handoff(PATIENT, "whatsapp", "billing", conv_id)
+    conversations._record_turn_sync(
+        PATIENT,
+        "I need a person",
+        "I've passed this chat to our clinic team.",
+        [_escalate_call(esc["escalation_id"])],
+        90,
+        conv_id,
+    )
+    return conv_id, esc["escalation_id"]
+
+
+# ---- request_handoff --------------------------------------------------------
+
+
+def test_request_handoff_opens_one_escalation(db):
+    first = escalation.request_handoff(PATIENT, "voice", " wants to talk about a bill ", "conv_1")
+    assert first["already_requested"] is False
+    [doc] = _escalations(db)
+    assert str(doc["_id"]) == first["escalation_id"]
+    assert doc["status"] == "open"
+    assert doc["conversationId"] == "conv_1"
+    assert doc["channel"] == "voice"
+    assert doc["patientPhone"] == "+919811122233"
+    assert doc["patientName"] == "Ravi Kumar"
+    assert doc["reason"] == "wants to talk about a bill"
+    assert doc["claimedBy"] is None and doc["resolvedAt"] is None
+    assert isinstance(doc["createdAt"], str)
+
+
+def test_one_unresolved_escalation_per_conversation(db):
+    first = escalation.request_handoff(PATIENT, "voice", "a", "conv_1")
+    again = escalation.request_handoff(PATIENT, "voice", "b", "conv_1")
+    assert again == {"escalation_id": first["escalation_id"], "already_requested": True}
+
+    db[escalation.COLLECTION].update_one({}, {"$set": {"status": "resolved"}})
+    later = escalation.request_handoff(PATIENT, "voice", "c", "conv_1")
+    assert later["already_requested"] is False
+    assert len(_escalations(db)) == 2
+
+
+def test_no_staff_alert_jobs_are_queued(db):
+    escalation.request_handoff(PATIENT, "whatsapp", "x", "conv_1")
+    assert list(db[outbox.COLLECTION].find()) == []
+
+
+# ---- the escalating turn hands the chat to staff -------------------------------
+
+
+def test_escalating_turn_hands_chat_to_staff(db):
+    conv_id, esc_id = _staff_chat(db)
+    doc = db[conversations.COLLECTION].find_one({"externalId": conv_id})
+    assert doc["handledBy"] == "staff"
+    assert doc["escalationId"] == esc_id
+    assert doc["escalatedAt"] and doc["lastPatientMessageAt"]
+    assert doc["status"] == "active"
+
+
+def test_escalation_linked_when_conversation_id_was_unknown(db):
+    esc = escalation.request_handoff(PATIENT, "whatsapp", "x", None)
+    conv_id = conversations._record_turn_sync(
+        PATIENT, "human please", "ok", [_escalate_call(esc["escalation_id"])], 50
+    )
+    assert _escalations(db)[0]["conversationId"] == conv_id
+
+
+def test_staff_chat_never_goes_idle(db):
+    conv_id, _ = _staff_chat(db)
+    old = "2000-01-01T00:00:00+00:00"
+    db[conversations.COLLECTION].update_one({"externalId": conv_id}, {"$set": {"endedAt": old}})
+    assert conversations.close_idle_active("2100-01-01T00:00:00+00:00") == 0
+
+    doc = db[conversations.COLLECTION].find_one({"externalId": conv_id})
+    doc["messages"][-1]["timestamp"] = old
+    assert conversations._is_stale(doc, conversations.datetime.now(conversations.UTC)) is False
+
+
+# ---- inbound while staff handle the chat ----------------------------------------
+
+
+async def test_messages_go_to_staff_not_the_ai(db, monkeypatch):
+    conv_id, _ = _staff_chat(db)
+
+    async def no_turn(*_a, **_k):
+        raise AssertionError("the AI must not reply while staff handle the chat")
+
+    async def no_send(*_a, **_k):
+        raise AssertionError("nothing may be sent to the patient")
+
+    monkeypatch.setattr(flusher, "run_turn", no_turn)
+    monkeypatch.setattr(flusher, "send_text_message", no_send)
+
+    await flusher._flush_one(PATIENT, ["hello?", "anyone there"])
+
+    doc = db[conversations.COLLECTION].find_one({"externalId": conv_id})
+    tail = doc["messages"][-2:]
+    assert [m["content"] for m in tail] == ["hello?", "anyone there"]
+    assert all(m["role"] == "patient" and m["type"] == "text" for m in tail)
+    assert doc["lastPatientMessageAt"] == tail[-1]["timestamp"]
+    hist = await history.get_history(PATIENT)
+    assert [m["content"] for m in hist[-2:]] == ["hello?", "anyone there"]
+
+
+async def test_ai_answers_again_once_handed_back(db, monkeypatch):
+    conv_id, _ = _staff_chat(db)
+    db[conversations.COLLECTION].update_one(
+        {"externalId": conv_id}, {"$set": {"handledBy": "agent"}}
+    )
+    assert await escalation.capture_for_staff(PATIENT, ["hi again"]) is False
+
+
+async def test_no_chat_with_staff_means_normal_turn(db):
+    assert await escalation.capture_for_staff(PATIENT, ["hi"]) is False
+
+
+# ---- staff.reply outbox job ------------------------------------------------------
+
+
+def _staff_reply(db, conv_id: str, text: str = "Hi Ravi, Priya here.", client_id: str = "c1"):
+    """What the console writes: the pending staff message + the outbox job."""
+    db[conversations.COLLECTION].update_one(
+        {"externalId": conv_id},
+        {
+            "$push": {
+                "messages": {
+                    "role": "staff",
+                    "type": "text",
+                    "content": text,
+                    "timestamp": "2026-11-18T10:00:00.000Z",
+                    "clientId": client_id,
+                    "staff": {"userId": "u1", "name": "Priya"},
+                    "delivery": {"status": "pending"},
+                }
+            }
+        },
+    )
+    db[outbox.COLLECTION].insert_one(
         {
             "clinicId": settings.CLINIC_ID,
-            "entityType": "staff",
-            "isActive": active,
-            "attributes": {"name": name, "phone": phone, "receivesEscalations": alerts},
+            "kind": outbox.STAFF_REPLY,
+            "appointmentId": None,
+            "status": "pending",
+            "attempts": 0,
+            "nextAttemptAt": "2000-01-01T00:00:00.000Z",
+            "createdAt": "2000-01-01T00:00:00.000Z",
+            "updatedAt": "2000-01-01T00:00:00.000Z",
+            "conversationId": conv_id,
+            "messageClientId": client_id,
+            "text": text,
+            "staffUserId": "u1",
+            "staffName": "Priya",
         }
     )
 
 
-@pytest.fixture
-def db(_no_real_mongo, monkeypatch):
-    fake = _no_real_mongo
-    catalog.clear_cache()
-    fake[catalog.DEFINITIONS].insert_one(
-        {"clinicId": settings.CLINIC_ID, "entityType": "staff", "kind": "custom", "fields": []}
-    )
-    fake["clinic"].insert_one({"clinicId": settings.CLINIC_ID, "clinicName": "MediDesk Clinic"})
-    fake["patients"].insert_one(
-        {"clinicId": settings.CLINIC_ID, "phone": PATIENT, "name": "Ravi Kumar"}
-    )
-    monkeypatch.setattr(settings, "STAFF_ALERTS_ENABLED", True)
-    monkeypatch.setattr(settings, "WHATSAPP_TEMPLATE_ESCALATION", "")
-    yield fake
-    catalog.clear_cache()
+def _staff_message(db, conv_id: str, client_id: str = "c1") -> dict:
+    doc = db[conversations.COLLECTION].find_one({"externalId": conv_id})
+    return next(m for m in doc["messages"] if m.get("clientId") == client_id)
 
 
 @pytest.fixture
@@ -48,109 +209,93 @@ def sent(monkeypatch):
     calls: list[tuple] = []
 
     async def text(to, body):
-        calls.append(("text", to, body))
+        calls.append((to, body))
         return {"messages": [{"id": "wamid.s1"}]}
 
-    async def template(to, name, lang, params):
-        calls.append(("template", to, name, lang, params))
-        return {"messages": [{"id": "wamid.s2"}]}
-
     monkeypatch.setattr(escalation.whatsapp, "send_text_message", text)
-    monkeypatch.setattr(escalation.whatsapp, "send_template_message", template)
     return calls
 
 
-def _alerts(db):
-    return list(db[outbox.COLLECTION].find({"kind": outbox.STAFF_ALERT}))
-
-
-def test_recipients_only_active_opted_in_with_valid_phone(db):
-    _staff(db, "Front desk", "98765 43210")
-    _staff(db, "Duplicate", "+91 98765-43210")  # same number → one alert
-    _staff(db, "Off", "9123456789", alerts=False)
-    _staff(db, "Inactive", "9123456780", active=False)
-    _staff(db, "No phone", "")
-    assert escalation.escalation_recipients() == [{"name": "Front desk", "phone": "919876543210"}]
-
-
-def test_no_staff_page_means_no_recipients(db):
-    db[catalog.DEFINITIONS].delete_many({})
-    catalog.clear_cache()
-    _staff(db, "Front desk", "9876543210")
-    assert escalation.escalation_recipients() == []
-
-
-def test_request_handoff_queues_one_job_per_staff_and_dedupes(db):
-    _staff(db, "Anita", "9876543210")
-    _staff(db, "Rahul", "9876543211")
-    first = escalation.request_handoff(PATIENT, "voice", "wants to talk about a bill")
-    assert first == {"staff_alerted": 2, "already_alerted": False}
-    jobs = _alerts(db)
-    assert {j["staffPhone"] for j in jobs} == {"919876543210", "919876543211"}
-    assert all(j["status"] == "pending" and j["appointmentId"] is None for j in jobs)
-
-    again = escalation.request_handoff(PATIENT, "voice", "still wants a human")
-    assert again == {"staff_alerted": 0, "already_alerted": True}
-    assert len(_alerts(db)) == 2
-
-
-def test_request_handoff_disabled(db, monkeypatch):
-    monkeypatch.setattr(settings, "STAFF_ALERTS_ENABLED", False)
-    _staff(db, "Anita", "9876543210")
-    assert escalation.request_handoff(PATIENT, "whatsapp", "x")["staff_alerted"] == 0
-    assert _alerts(db) == []
-
-
-async def test_worker_sends_text_alert(db, sent):
-    _staff(db, "Anita", "9876543210")
-    escalation.request_handoff(PATIENT, "voice", "billing question")
+async def test_staff_reply_is_sent_and_marked(db, sent):
+    conv_id, _ = _staff_chat(db)
+    _staff_reply(db, conv_id)
     assert await outbox.process_one(followups.HANDLERS)
-    [(kind, to, body)] = sent
-    assert (kind, to) == ("text", "919876543210")
-    for part in ("Hi Anita", "Ravi Kumar", "+919811122233", "voice call", "billing question"):
-        assert part in body
-    assert "call them back" in body
-    assert _alerts(db)[0]["status"] == "done"
+
+    assert sent == [(PATIENT, "Hi Ravi, Priya here.")]
+    delivery = _staff_message(db, conv_id)["delivery"]
+    assert delivery["status"] == "sent" and delivery["waMessageId"] == "wamid.s1"
+    assert db[outbox.COLLECTION].find_one({"kind": outbox.STAFF_REPLY})["status"] == "done"
+    # The AI sees what staff said once the chat is handed back.
+    hist = await history.get_history(PATIENT)
+    assert hist[-1] == {**hist[-1], "role": "staff", "content": "Hi Ravi, Priya here."}
 
 
-async def test_worker_uses_template_when_configured(db, sent, monkeypatch):
-    monkeypatch.setattr(settings, "WHATSAPP_TEMPLATE_ESCALATION", "staff_handoff")
-    _staff(db, "Anita", "9876543210")
-    escalation.request_handoff(PATIENT, "whatsapp", "complaint")
-    await outbox.process_one(followups.HANDLERS)
-    [(kind, to, name, _lang, params)] = sent
-    assert (kind, to, name) == ("template", "919876543210", "staff_handoff")
-    assert params == [
-        "Ravi Kumar",
-        "+919811122233",
-        "WhatsApp chat",
-        "complaint",
-        "MediDesk Clinic",
-    ]
-
-
-async def test_rejected_alert_fails_permanently(db, monkeypatch):
-    _staff(db, "Anita", "9876543210")
-    escalation.request_handoff(PATIENT, "whatsapp", "x")
-
+def _http_error(status: int):
     async def reject(to, body):
-        resp = httpx.Response(400, request=httpx.Request("POST", "https://graph"))
-        raise httpx.HTTPStatusError("400", request=resp.request, response=resp)
+        resp = httpx.Response(status, request=httpx.Request("POST", "https://graph"))
+        raise httpx.HTTPStatusError(str(status), request=resp.request, response=resp)
 
-    monkeypatch.setattr(escalation.whatsapp, "send_text_message", reject)
+    return reject
+
+
+async def test_rejected_staff_reply_fails_at_once(db, monkeypatch):
+    conv_id, _ = _staff_chat(db)
+    _staff_reply(db, conv_id)
+    monkeypatch.setattr(escalation.whatsapp, "send_text_message", _http_error(400))
     await outbox.process_one(followups.HANDLERS)
-    assert _alerts(db)[0]["status"] == "failed"
+
+    assert db[outbox.COLLECTION].find_one({"kind": outbox.STAFF_REPLY})["status"] == "failed"
+    delivery = _staff_message(db, conv_id)["delivery"]
+    assert delivery["status"] == "failed" and "400" in delivery["error"]
 
 
-async def test_tool_uses_session_caller_and_channel(db):
-    _staff(db, "Anita", "9876543210")
-    ctx = SimpleNamespace(state={CALLER_PHONE: PATIENT, CHANNEL: "voice"})
+async def test_transient_error_retries_then_fails_message(db, monkeypatch):
+    conv_id, _ = _staff_chat(db)
+    _staff_reply(db, conv_id)
+    monkeypatch.setattr(escalation.whatsapp, "send_text_message", _http_error(503))
+
+    await outbox.process_one(followups.HANDLERS)
+    job = db[outbox.COLLECTION].find_one({"kind": outbox.STAFF_REPLY})
+    assert job["status"] == "pending"  # will retry
+    assert _staff_message(db, conv_id)["delivery"]["status"] == "pending"
+
+    # Last attempt: the message is marked failed so staff aren't left guessing.
+    db[outbox.COLLECTION].update_one(
+        {"_id": job["_id"]},
+        {"$set": {"attempts": outbox.MAX_ATTEMPTS - 1, "nextAttemptAt": "2000-01-01"}},
+    )
+    await outbox.process_one(followups.HANDLERS)
+    assert db[outbox.COLLECTION].find_one({"_id": job["_id"]})["status"] == "failed"
+    assert _staff_message(db, conv_id)["delivery"]["status"] == "failed"
+
+
+async def test_reply_to_unknown_conversation_fails(db, sent):
+    _staff_reply(db, "conv_missing")
+    await outbox.process_one(followups.HANDLERS)
+    assert sent == []
+    assert db[outbox.COLLECTION].find_one({"kind": outbox.STAFF_REPLY})["status"] == "failed"
+
+
+# ---- the tool ------------------------------------------------------------------
+
+
+async def test_tool_opens_escalation_for_the_session(db):
+    ctx = SimpleNamespace(
+        state={CALLER_PHONE: PATIENT, CHANNEL: "voice", CONVERSATION_ID: "conv_9"}
+    )
     result = await escalate_to_human("wants a person", ctx)
     assert result["escalated"] is True
     assert "call you back" in result["message"]
-    assert result["staff_alerted"] == 1
-    assert _alerts(db)[0]["patientPhone"] == PATIENT
-    assert _alerts(db)[0]["channel"] == "voice"
+    assert result["already_requested"] is False
+    [doc] = _escalations(db)
+    assert str(doc["_id"]) == result["escalation_id"]
+    assert (doc["conversationId"], doc["channel"]) == ("conv_9", "voice")
+
+
+async def test_tool_whatsapp_message(db):
+    ctx = SimpleNamespace(state={CALLER_PHONE: PATIENT, CHANNEL: "whatsapp"})
+    result = await escalate_to_human("x", ctx)
+    assert "reply to you here" in result["message"]
 
 
 async def test_tool_never_fails_the_turn(db, monkeypatch):
@@ -161,4 +306,3 @@ async def test_tool_never_fails_the_turn(db, monkeypatch):
     ctx = SimpleNamespace(state={CALLER_PHONE: PATIENT, CHANNEL: "whatsapp"})
     result = await escalate_to_human("x", ctx)
     assert result["escalated"] is True and "error" not in result
-    assert "reply to you here" in result["message"]

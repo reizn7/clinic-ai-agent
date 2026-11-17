@@ -22,13 +22,14 @@ from clinic_agent.whatsapp.webhook import router as webhook_router  # noqa: E402
 @contextlib.asynccontextmanager
 def _ensure_indexes() -> None:
     """Clinic-scoped indexes (idempotent). Never blocks startup: log and carry on."""
-    from clinic_agent.runtime import conversations, debounce
+    from clinic_agent.runtime import conversations, debounce, escalation
     from clinic_agent.tools import repo
 
     for ensure in (
         repo.ensure_indexes,
         conversations.ensure_indexes,
         debounce.ensure_indexes,
+        escalation.ensure_indexes,
     ):
         try:
             ensure()

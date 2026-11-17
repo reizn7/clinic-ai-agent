@@ -1,169 +1,188 @@
-"""Human handoff: alert the clinic's staff when a patient asks for a person.
+"""Human handoff: escalation requests for the staff console, and staff replies.
 
-``escalate_to_human`` (the agent tool) calls ``request_handoff``. It queues one
-``staff.alert`` outbox job per staff member who should hear about it, and the
-outbox worker sends each one a WhatsApp alert (``alert_staff``). Queuing keeps a
-slow or failing Meta call out of the patient's conversation and gives retries.
+The contract lives in the console repo: ``docs/staff-handoff-contract.md``.
 
-**Who is alerted** is configured in the console on the **Staff** custom page
-(``records`` with ``entityType: "staff"``, see the clinic data contract): every
-active row with ``receivesEscalations: true`` and a usable ``phone``. The page is
-not ``agentEnabled`` and its fields are not agent-visible, so staff numbers never
-reach the model; only this module reads them.
+* ``escalate_to_human`` (the agent tool) calls ``request_handoff``, which inserts
+  one ``escalations`` document (``status: "open"``). Staff work these on the
+  console's **Escalations** page; voice callers are phoned back from there.
+* **WhatsApp:** the turn that escalates flips its conversation to
+  ``handledBy: "staff"`` (``conversations.record_turn``). From then on the AI
+  stays quiet: ``capture_for_staff`` stores the patient's messages for staff to
+  read, until the console resolves the escalation and sets ``handledBy`` back.
+* Staff replies are ``staff.reply`` outbox jobs the console inserts; ``send_staff_reply``
+  delivers them and records the delivery on the staff message.
 
-**No spam.** If staff were already alerted about the same patient within
-``DEDUPE_WINDOW``, asking again doesn't alert them again.
-
-Alert wording is fixed text built from stored data. Outside WhatsApp's 24-hour
-window Meta only delivers approved templates; set ``WHATSAPP_TEMPLATE_ESCALATION``
-to one with body params {{1}} patient name, {{2}} patient phone, {{3}} channel,
-{{4}} reason, {{5}} clinic name.
+No WhatsApp alerts go to staff phones.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime
 
 from clinic_agent.config import settings
-from clinic_agent.db import get_db
-from clinic_agent.phone import is_valid_phone, normalize_phone, to_e164
-from clinic_agent.runtime import outbox
+from clinic_agent.db import create_index_safe, get_db
+from clinic_agent.phone import to_e164
+from clinic_agent.runtime import conversations, history, outbox
 from clinic_agent.runtime.outbox import PermanentError
-from clinic_agent.tools import catalog
 from clinic_agent.whatsapp import client as whatsapp
 
 log = logging.getLogger("clinic_agent.runtime.escalation")
 
-STAFF_TYPE = "staff"
-DEDUPE_WINDOW = timedelta(minutes=30)
-_CHANNEL_LABEL = {"whatsapp": "WhatsApp chat", "voice": "voice call"}
+COLLECTION = conversations.ESCALATIONS
+OPEN, CLAIMED, RESOLVED = "open", "claimed", "resolved"
+REASON_MAX = 300
 
 
-def escalation_recipients(clinic_id: str | None = None) -> list[dict]:
-    """Active staff with handoff alerts on: [{name, phone (digits)}]."""
-    clinic_id = clinic_id or settings.CLINIC_ID
-    if STAFF_TYPE not in catalog.get_definitions(clinic_id):
-        return []  # page missing or archived
-    out: list[dict] = []
-    seen: set[str] = set()
-    for doc in get_db()[catalog.RECORDS].find(
-        {"clinicId": clinic_id, "entityType": STAFF_TYPE, "isActive": True}
-    ):
-        attrs = doc.get("attributes") or {}
-        if attrs.get("receivesEscalations") is not True:
-            continue
-        raw = attrs.get("phone")
-        if not isinstance(raw, str) or not is_valid_phone(raw):
-            log.warning("staff %s has handoff alerts on but no valid phone", doc.get("_id"))
-            continue
-        phone = normalize_phone(raw)
-        if phone in seen:
-            continue
-        seen.add(phone)
-        out.append({"name": str(attrs.get("name") or "Team"), "phone": phone})
-    return out
+def ensure_indexes() -> None:
+    col = get_db()[COLLECTION]
+    create_index_safe(
+        col, [("clinicId", 1), ("status", 1), ("createdAt", -1)], name="clinic_status_created"
+    )
+    create_index_safe(
+        col,
+        [("clinicId", 1), ("conversationId", 1), ("status", 1)],
+        name="clinic_conversation_status",
+    )
 
 
-def _recently_alerted(patient_phone: str) -> bool:
-    since = (datetime.now(UTC) - DEDUPE_WINDOW).isoformat()
-    return (
-        get_db()[outbox.COLLECTION].find_one(
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+# ---- the tool's side: open an escalation ---------------------------------------
+
+
+def _patient_name(patient_phone: str) -> str:
+    doc = get_db()["patients"].find_one(
+        {"clinicId": settings.CLINIC_ID, "phone": patient_phone}, {"name": 1}
+    )
+    return str((doc or {}).get("name") or "")
+
+
+def request_handoff(
+    patient_phone: str, channel: str, reason: str, conversation_id: str | None
+) -> dict:
+    """Open an escalation for staff. Returns ``{escalation_id, already_requested}``.
+
+    At most one unresolved escalation per conversation: asking again returns the
+    existing one.
+    """
+    col = get_db()[COLLECTION]
+    if conversation_id:
+        existing = col.find_one(
             {
                 "clinicId": settings.CLINIC_ID,
-                "kind": outbox.STAFF_ALERT,
-                "patientPhone": patient_phone,
-                "createdAt": {"$gte": since},
-                "status": {"$ne": "failed"},
-            }
+                "conversationId": conversation_id,
+                "status": {"$ne": RESOLVED},
+            },
+            {"_id": 1},
         )
-        is not None
+        if existing:
+            return {"escalation_id": str(existing["_id"]), "already_requested": True}
+    now = _now()
+    res = col.insert_one(
+        {
+            "clinicId": settings.CLINIC_ID,
+            "conversationId": conversation_id,
+            "channel": channel,
+            "patientPhone": to_e164(patient_phone) if patient_phone else "",
+            "patientName": _patient_name(patient_phone) if patient_phone else "",
+            "reason": (reason or "").strip()[:REASON_MAX],
+            "status": OPEN,
+            "createdAt": now,
+            "updatedAt": now,
+            "claimedBy": None,
+            "claimedByName": None,
+            "claimedAt": None,
+            "resolvedBy": None,
+            "resolvedByName": None,
+            "resolvedAt": None,
+            "resolutionNote": None,
+        }
+    )
+    log.info(
+        "escalation %s opened (%s, conversation %s)", res.inserted_id, channel, conversation_id
+    )
+    return {"escalation_id": str(res.inserted_id), "already_requested": False}
+
+
+# ---- inbound while staff handle the chat -----------------------------------------
+
+
+async def capture_for_staff(phone: str, texts: list[str]) -> bool:
+    """If staff are handling this patient's chat, store the messages and return True.
+
+    The caller then skips the AI turn: no reply is sent.
+    """
+    conv_id = await asyncio.to_thread(conversations.record_staff_handled_messages, phone, texts)
+    if conv_id is None:
+        return False
+    await history.append_messages(phone, [{"role": "user", "content": t} for t in texts])
+    log.info("chat %s is with staff: stored %d message(s), no AI reply", conv_id, len(texts))
+    return True
+
+
+# ---- outbox handler: deliver a staff reply ---------------------------------------
+
+
+def _mark_delivery(conversation_id: str, client_id: str, delivery: dict) -> None:
+    get_db()[conversations.COLLECTION].update_one(
+        {
+            "clinicId": settings.CLINIC_ID,
+            "externalId": conversation_id,
+            "messages.clientId": client_id,
+        },
+        {"$set": {"messages.$.delivery": {**delivery, "at": _now()}}},
     )
 
 
-def request_handoff(patient_phone: str, channel: str, reason: str) -> dict:
-    """Queue staff alerts for this patient. Returns {staff_alerted, already_alerted}."""
-    if not settings.STAFF_ALERTS_ENABLED or not patient_phone:
-        return {"staff_alerted": 0, "already_alerted": False}
-    if _recently_alerted(patient_phone):
-        return {"staff_alerted": 0, "already_alerted": True}
-    recipients = escalation_recipients()
-    if not recipients:
-        log.warning("handoff requested but no staff receive alerts (Staff page)")
-    for r in recipients:
-        outbox.enqueue_staff_alert(
-            patientPhone=patient_phone,
-            channel=channel,
-            reason=(reason or "").strip()[:300],
-            staffName=r["name"],
-            staffPhone=r["phone"],
-        )
-    return {"staff_alerted": len(recipients), "already_alerted": False}
-
-
-# ---- outbox handler -------------------------------------------------------------
-
-
-def _context_sync(patient_phone: str) -> tuple[str, str]:
-    """(patient name or "", clinic name) from the stored records."""
-    scope = {"clinicId": settings.CLINIC_ID}
-    patient = get_db()["patients"].find_one({**scope, "phone": patient_phone}) or {}
-    clinic = get_db()["clinic"].find_one(scope) or {}
-    return str(patient.get("name") or ""), str(clinic.get("clinicName") or "the clinic")
-
-
-def alert_text(job: dict, patient_name: str, clinic_name: str, at: datetime) -> str:
-    phone = to_e164(job["patientPhone"])
-    channel = _CHANNEL_LABEL.get(job.get("channel", ""), job.get("channel") or "chat")
-    follow_up = (
-        "Reply to them on WhatsApp from the clinic number."
-        if job.get("channel") == "whatsapp"
-        else "Please call them back on this number."
+def _conversation_phone(conversation_id: str) -> str | None:
+    doc = get_db()[conversations.COLLECTION].find_one(
+        {"clinicId": settings.CLINIC_ID, "externalId": conversation_id},
+        {"phone": 1, "channel": 1},
     )
-    return (
-        f"Patient wants to talk to a person - {clinic_name}\n\n"
-        f"Hi {job.get('staffName') or 'team'},\n"
-        f"Patient: {patient_name or 'Not given yet'}\n"
-        f"Phone: {phone}\n"
-        f"Via: {channel}\n"
-        f"Reason: {job.get('reason') or 'Asked for a human'}\n"
-        f"Time: {at:%-d %b, %-I:%M %p}\n\n"
-        f"{follow_up}"
-    )
+    if not doc or doc.get("channel", conversations.CHANNEL) != conversations.CHANNEL:
+        return None
+    digits = "".join(ch for ch in str(doc.get("phone") or "") if ch.isdigit())
+    return digits or None
 
 
-async def alert_staff(job: dict) -> tuple[str, dict]:
-    """Send one staff member the handoff alert (outbox ``staff.alert``)."""
-    patient_name, clinic_name = await asyncio.to_thread(_context_sync, job["patientPhone"])
-    template = settings.WHATSAPP_TEMPLATE_ESCALATION
-    try:
-        if template:
-            params = [
-                patient_name or "Not given",
-                to_e164(job["patientPhone"]),
-                _CHANNEL_LABEL.get(job.get("channel", ""), "chat"),
-                job.get("reason") or "Asked for a human",
-                clinic_name,
-            ]
-            resp = await whatsapp.send_template_message(
-                job["staffPhone"], template, settings.WHATSAPP_TEMPLATE_LANGUAGE, params
+async def send_staff_reply(job: dict) -> tuple[str, dict]:
+    """Send one staff reply to the patient on WhatsApp (outbox ``staff.reply``)."""
+    conversation_id = str(job.get("conversationId") or "")
+    client_id = str(job.get("messageClientId") or "")
+    text = str(job.get("text") or "").strip()
+
+    async def fail(error: str) -> PermanentError:
+        if client_id:
+            await asyncio.to_thread(
+                _mark_delivery, conversation_id, client_id, {"status": "failed", "error": error}
             )
-        else:
-            now = datetime.now(ZoneInfo(settings.CLINIC_TIMEZONE))
-            body = alert_text(job, patient_name, clinic_name, now)
-            resp = await whatsapp.send_text_message(job["staffPhone"], body)
+        return PermanentError(error)
+
+    if not text:
+        raise await fail("empty message")
+    phone = await asyncio.to_thread(_conversation_phone, conversation_id)
+    if phone is None:
+        raise await fail("no WhatsApp conversation for this reply")
+
+    try:
+        resp = await whatsapp.send_text_message(phone, text)
     except Exception as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if status is not None and 400 <= status < 500 and status != 429:
-            # Usually: the staff number hasn't messaged the clinic in 24h and no
-            # template is configured, or the number isn't on WhatsApp.
-            raise PermanentError(f"WhatsApp rejected the staff alert ({status})") from exc
+            # Usually the 24-hour window has closed, or the number left WhatsApp.
+            raise await fail(f"WhatsApp rejected the message ({status})") from exc
+        if job.get("attempts", 1) >= outbox.MAX_ATTEMPTS:
+            raise await fail("couldn't reach WhatsApp; gave up after retries") from exc
         raise
+
     message_id = ((resp or {}).get("messages") or [{}])[0].get("id")
-    return "done", {
-        "result": "sent",
-        "messageId": message_id,
-        "via": "template" if template else "text",
-    }
+    await asyncio.to_thread(
+        _mark_delivery, conversation_id, client_id, {"status": "sent", "waMessageId": message_id}
+    )
+    # The AI reads this when the chat is handed back, so it knows what staff said.
+    await history.append_messages(phone, [{"role": "staff", "content": text}])
+    return "done", {"result": "sent", "messageId": message_id}
