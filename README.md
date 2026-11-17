@@ -499,6 +499,8 @@ the model's input rate, and plays the model's output rate itself.
 ### `voice/static/call.html`
 One self-contained page (vanilla JS, no external scripts, light/dark, phone-sized).
 It reads `token` from its own URL and derives `ws:`/`wss:` from `location.protocol`.
+To host the page elsewhere (e.g. Vercel), set `DEFAULT_SERVER` in the script or open it
+with `?server=<backend host>&token=…`; it then connects to `wss://<backend>/voice/ws`.
 Two inline AudioWorklets (loaded from a Blob URL) handle the audio:
 - `capture` downmixes the mic to mono, downsamples from the context rate to
   `input_rate` with a box filter, and posts 100 ms PCM16 frames (3,200 bytes).

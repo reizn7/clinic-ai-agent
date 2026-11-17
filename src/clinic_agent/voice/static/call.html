@@ -268,11 +268,24 @@ function looksLikePhone(raw) {
   return digits.length >= 10 && digits.length <= 15 && !digits.startsWith("0");
 }
 
+// Backend that serves /voice/ws. Empty = the host this page was loaded from (the
+// normal case). Set it, or pass ?server=…, when the page is hosted elsewhere
+// (e.g. Vercel). Accepts "https://host", "wss://host" or a bare "host" (→ wss).
+const DEFAULT_SERVER = "";
+
 function wsUrl() {
-  const token = new URLSearchParams(location.search).get("token");
-  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams(location.search);
+  const token = params.get("token");
   const qs = token ? "?token=" + encodeURIComponent(token) : "";
-  return scheme + "//" + location.host + "/voice/ws" + qs;
+  const server = (params.get("server") || DEFAULT_SERVER).trim().replace(/\/+$/, "");
+  if (!server) {
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    return scheme + "//" + location.host + "/voice/ws" + qs;
+  }
+  const base = /^[a-z]+:\/\//i.test(server)
+    ? server.replace(/^http(s?):/i, "ws$1:")
+    : "wss://" + server;
+  return base + "/voice/ws" + qs;
 }
 
 function newCallId() {
