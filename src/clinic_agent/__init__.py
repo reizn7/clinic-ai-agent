@@ -1,1 +1,1 @@
-"""clinic-ai-agent v2 — WhatsApp text agent."""
+"""Medi Desk AI — the AI receptionist agent (WhatsApp + voice)."""

@@ -28,7 +28,7 @@ from clinic_agent.runtime.tool_capture import (  # noqa: F401  (re-exported; tes
 
 log = logging.getLogger("clinic_agent.runtime.turn")
 
-APP_NAME = "clinic-ai-agent"
+APP_NAME = "medi-desk-ai"
 
 FALLBACK_REPLY = (
     "Sorry — I hit a problem on my end and couldn't finish that. "

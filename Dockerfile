@@ -20,4 +20,4 @@ COPY scripts ./scripts
 ENV PORT=3000
 EXPOSE 3000
 
-CMD ["uv", "run", "--no-dev", "clinic-agent"]
+CMD ["uv", "run", "--no-dev", "medi-desk-ai"]

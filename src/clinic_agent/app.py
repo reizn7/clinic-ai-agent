@@ -1,4 +1,4 @@
-"""FastAPI application entrypoint for the clinic agent (v2): WhatsApp + browser voice calls."""
+"""FastAPI application entrypoint for Medi Desk AI: WhatsApp + browser voice calls."""
 
 from __future__ import annotations
 
@@ -62,11 +62,11 @@ def create_app() -> FastAPI:
     # Langfuse tracing (no-op unless LANGFUSE_ENABLED + keys). ADK's own OTel spans
     # are picked up from here on.
     init_tracing()
-    app = FastAPI(title="Clinic AI Agent v2", lifespan=lifespan)
+    app = FastAPI(title="Medi Desk AI", lifespan=lifespan)
 
     @app.get("/")
     async def health() -> dict[str, str]:
-        return {"status": "Clinic AI Agent v2 running"}
+        return {"status": "Medi Desk AI running"}
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

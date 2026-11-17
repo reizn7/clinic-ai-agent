@@ -120,7 +120,7 @@ def event_body(s: Snapshot) -> dict:
         "description": (
             f"Patient: {patient}\n"
             f"Phone: +{s.patient_phone}\n"
-            f"Booked by the {s.clinic_name} AI receptionist.\n"
+            f"Booked via Medi Desk AI, {s.clinic_name}'s AI receptionist.\n"
             f"Booking ref: {s.reference} (status: {s.status})"
         ),
         "start": {"dateTime": start.isoformat(), "timeZone": tz},

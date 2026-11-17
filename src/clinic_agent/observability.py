@@ -40,7 +40,7 @@ from clinic_agent.config import settings
 
 log = logging.getLogger("clinic_agent.observability")
 
-SERVICE_NAME = "clinic-ai-agent"
+SERVICE_NAME = "medi-desk-ai"
 
 _client: Any = None  # langfuse.Langfuse once initialised
 

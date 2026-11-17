@@ -11,7 +11,7 @@ utterance it keeps streaming silence until the agent's reply has finished (no ne
 audio for ``--reply-gap`` seconds AND the received audio would have finished
 playing in real time), then plays the next utterance.
 
-Usage (server running locally: ``uv run clinic-agent``)::
+Usage (server running locally: ``uv run medi-desk-ai``)::
 
     # greeting only
     uv run python scripts/voice_sim.py

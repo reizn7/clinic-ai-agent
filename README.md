@@ -1,6 +1,6 @@
-# clinic-ai-agent
+# Medi Desk AI: agent
 
-A **WhatsApp and browser voice-call AI receptionist for a medical clinic.** Patients
+**Medi Desk AI** is a **WhatsApp and browser voice-call AI receptionist for medical clinics.** This repo is the agent; the staff console lives in `receptionist-agent-platform`. Patients
 message the clinic's WhatsApp number, or open the clinic's call page in a browser,
 enter their phone number, click "Call the clinic", and talk in natural language. A
 Google ADK + Gemini agent answers clinic questions, checks doctor availability, and
@@ -258,13 +258,13 @@ v1/                      original Node.js/Express/Mongoose prototype (reference 
 ## Module reference
 
 ### `app.py`
-- `create_app()` sets up logging and exposes `GET /` (`{"status": "Clinic AI Agent v2 running"}`),
+- `create_app()` sets up logging and exposes `GET /` (`{"status": "Medi Desk AI running"}`),
   `GET /healthz` (`{"status": "ok"}`), and mounts the webhook router at `/webhook`.
 - `lifespan` starts `sweeper.run_forever()` and `flusher.run_forever()` as asyncio
   tasks and cancels them on shutdown.
 - When `VOICE_ENABLED` is true, it also mounts the voice router: the call page
   (`GET /voice/call`) and its WebSocket (`WS /voice/ws`).
-- `main()` is the `clinic-agent` console script. It runs uvicorn on `0.0.0.0:$PORT`.
+- `main()` is the `medi-desk-ai` console script (`clinic-agent` still works as an alias). It runs uvicorn on `0.0.0.0:$PORT`.
 
 ### `phone.py`
 - `normalize_phone(raw, default_cc="91")` turns a number typed on the call page into
@@ -653,7 +653,7 @@ cp .env.example .env                  # fill in the values above
 uv run python scripts/seed.py         # idempotent: clinic + 2 doctors + indexes
 # or, for a richer demo dataset (WIPES this CLINIC_ID's patients/appointments/conversations/transcripts/pending_messages/clinic/doctors):
 # uv run python scripts/seed_demo.py
-uv run clinic-agent                   # serves on :$PORT (default 3000)
+uv run medi-desk-ai                   # serves on :$PORT (default 3000)
 ```
 
 ### Seed data
@@ -681,7 +681,7 @@ recipient under **API Setup**, then text the business number.
 ### Voice calls in the browser (local dev)
 
 ```bash
-uv run clinic-agent
+uv run medi-desk-ai
 cloudflared tunnel --url http://localhost:3000      # or: ngrok http 3000
 ```
 
@@ -767,11 +767,11 @@ analytics.
 ## Deployment
 
 A single container ([`Dockerfile`](Dockerfile), `ghcr.io/astral-sh/uv:python3.14-bookworm-slim`,
-`uv sync --frozen --no-dev`, `CMD uv run --no-dev clinic-agent`):
+`uv sync --frozen --no-dev`, `CMD uv run --no-dev medi-desk-ai`):
 
 ```bash
-docker build -t clinic-ai-agent .
-docker run --env-file .env -p 3000:3000 clinic-ai-agent
+docker build -t medi-desk-ai .
+docker run --env-file .env -p 3000:3000 medi-desk-ai
 ```
 
 Host it anywhere with HTTPS (Render, Railway, Fly.io) and point the Meta webhook at

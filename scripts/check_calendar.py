@@ -46,7 +46,7 @@ async def main() -> None:
     )
     event_id = "check" + uuid.uuid4().hex  # base32hex-safe
     body = {
-        "summary": "Clinic AI receptionist: calendar test",
+        "summary": "Medi Desk AI: calendar test",
         "description": "Created by scripts/check_calendar.py. Safe to delete.",
         "start": {"dateTime": start.isoformat(), "timeZone": settings.CLINIC_TIMEZONE},
         "end": {
