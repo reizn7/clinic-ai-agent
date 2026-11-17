@@ -60,6 +60,19 @@ class Settings(BaseSettings):
     VOICE_NAME: str = ""  # optional prebuilt voice, e.g. "Kore"; empty = model default
     VOICE_WS_TOKEN: str = ""  # optional shared secret; if set, open /voice/call?token=<it>
 
+    # --- Tracing (Langfuse, OpenTelemetry-based) ---
+    # Off unless enabled AND both keys are set; the app never needs Langfuse to run.
+    LANGFUSE_ENABLED: bool = False
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_BASE_URL: str = Field(
+        default="https://cloud.langfuse.com",
+        validation_alias=AliasChoices("LANGFUSE_BASE_URL", "LANGFUSE_HOST"),
+    )
+    LANGFUSE_ENVIRONMENT: str = "development"  # e.g. development / staging / production
+    # Redact phone numbers from trace payloads and hash them for user/session ids.
+    LANGFUSE_MASK_PHONES: bool = True
+
     # --- App ---
     LOG_LEVEL: str = "INFO"
     PORT: int = 3000

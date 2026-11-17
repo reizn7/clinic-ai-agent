@@ -17,6 +17,7 @@ from typing import Literal
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 
+from clinic_agent import observability
 from clinic_agent.runtime import conversations
 from clinic_agent.runtime.agent import build_agent
 from clinic_agent.runtime.history import append_turn, get_history
@@ -97,15 +98,53 @@ def _final_text(event) -> str:
     return "".join(getattr(p, "text", "") or "" for p in parts)
 
 
-async def run_turn(phone: str, message: str) -> str:
-    """Produce the agent's reply to one inbound message from ``phone``."""
+async def run_turn(phone: str, message: str, *, bubbles: int = 1) -> str:
+    """Produce the agent's reply to one inbound message from ``phone``.
+
+    Traced as one Langfuse trace (``handle-whatsapp-message``) inside the
+    conversation's session; ADK's agent/LLM/tool spans nest under it. ``bubbles``
+    = how many WhatsApp messages the debounce merged into this turn.
+    """
+    try:
+        conversation_id: str | None = await conversations.resolve_conversation_id(phone)
+    except Exception:
+        log.exception("Could not resolve conversation for %s", phone)
+        conversation_id = None
+
+    with observability.trace_root(
+        "handle-whatsapp-message",
+        phone=phone,
+        channel="whatsapp",
+        session_id=conversation_id,
+        input=message,
+        metadata={"bubbles": bubbles, "conversation_id": conversation_id},
+    ) as obs:
+        reply, tool_calls, failed = await _run_turn(phone, message, conversation_id)
+        update: dict = {
+            "output": reply,
+            "metadata": {
+                "tools": [c.get("name") for c in tool_calls],
+                "tool_errors": sum(c.get("status") == "error" for c in tool_calls),
+            },
+        }
+        if failed:
+            update |= {"level": "ERROR", "status_message": "turn failed; fallback reply sent"}
+        obs.update(**update)
+        return reply
+
+
+async def _run_turn(
+    phone: str, message: str, conversation_id: str | None = None
+) -> tuple[str, list[dict], bool]:
+    """The turn itself → ``(reply, tool_calls, failed)``."""
     history = await get_history(phone)
     seeded = contextualize(message, history, phone)
 
     # Fresh session per turn: history is carried in the prompt, not ADK state.
     session_id = uuid.uuid4().hex
+    adk_user = observability.adk_user_id(phone, fallback=session_id)
     await _runner.session_service.create_session(
-        app_name=APP_NAME, user_id=phone, session_id=session_id
+        app_name=APP_NAME, user_id=adk_user, session_id=session_id
     )
 
     new_message = types.Content(role="user", parts=[types.Part.from_text(text=seeded)])
@@ -117,7 +156,7 @@ async def run_turn(phone: str, message: str) -> str:
 
     try:
         async for event in _runner.run_async(
-            user_id=phone, session_id=session_id, new_message=new_message
+            user_id=adk_user, session_id=session_id, new_message=new_message
         ):
             recorder.observe(event)
             text = _final_text(event)
@@ -128,8 +167,10 @@ async def run_turn(phone: str, message: str) -> str:
         latency_ms = round((time.perf_counter() - t0) * 1000)
         # Record the failed turn in both stores so we're not blind to it.
         await append_turn(phone, message, FALLBACK_REPLY, tool_calls)
-        await conversations.record_turn(phone, message, FALLBACK_REPLY, tool_calls, latency_ms)
-        return FALLBACK_REPLY
+        await conversations.record_turn(
+            phone, message, FALLBACK_REPLY, tool_calls, latency_ms, conversation_id
+        )
+        return FALLBACK_REPLY, tool_calls, True
 
     latency_ms = round((time.perf_counter() - t0) * 1000)
     reply = reply.strip() or FALLBACK_REPLY
@@ -137,5 +178,7 @@ async def run_turn(phone: str, message: str) -> str:
     # transcripts: lean prompt-history (+ tool results for recall);
     # conversations: full console record.
     await append_turn(phone, message, reply, tool_calls)
-    await conversations.record_turn(phone, message, reply, tool_calls, latency_ms)
-    return reply
+    await conversations.record_turn(
+        phone, message, reply, tool_calls, latency_ms, conversation_id
+    )
+    return reply, tool_calls, False

@@ -5,7 +5,7 @@ description = "WhatsApp + browser voice-call (Gemini Live) clinic AI agent — G
 readme = "PLAN.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
-    "google-adk",
+    "google-adk>=2.14.1",
     "google-genai",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -15,6 +15,8 @@ dependencies = [
     "pydantic-settings>=2.4",
     "python-dotenv>=1.0",
     "certifi>=2024.0",
+    "langfuse>=5.2.0",
+    "openinference-instrumentation-google-adk>=1.1.6",
 ]
 
 [project.scripts]

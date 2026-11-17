@@ -43,6 +43,7 @@ from google.adk.runners import InMemoryRunner, Runner
 from google.genai import types
 from starlette.websockets import WebSocketDisconnect
 
+from clinic_agent import observability
 from clinic_agent.config import settings
 from clinic_agent.phone import is_valid_phone, normalize_phone
 from clinic_agent.runtime import conversations
@@ -51,6 +52,7 @@ from clinic_agent.runtime.history import append_turn, get_history
 from clinic_agent.runtime.tool_capture import ToolCallRecorder
 from clinic_agent.runtime.turn import contextualize
 from clinic_agent.voice import audio, protocol
+from clinic_agent.voice.call_trace import CallTracer
 
 log = logging.getLogger("clinic_agent.voice.bridge")
 
@@ -145,6 +147,17 @@ class CallTranscript:
         self._current()["tools"].append(call)
 
 
+def _transcript_messages(turns: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """A call's turns as role-labelled chat messages (for the trace output)."""
+    out: list[dict[str, str]] = []
+    for turn in turns:
+        if turn["user"] and turn["user"] != conversations.CALL_STARTED:
+            out.append({"role": "user", "content": turn["user"]})
+        if turn["assistant"]:
+            out.append({"role": "assistant", "content": turn["assistant"]})
+    return out
+
+
 class CallBridge:
     def __init__(
         self,
@@ -160,11 +173,14 @@ class CallBridge:
         self.runner = runner
         self.run_config = run_config
         self.phone = normalize_phone(start.caller)
-        self.user_id = self.phone or self.call_id
+        # ADK-only key (its in-memory session); hashed so traces carry no phone.
+        self.user_id = observability.adk_user_id(self.phone, fallback=self.call_id)
         self.session_id = uuid.uuid4().hex
         self.queue = LiveRequestQueue()
         self.recorder = ToolCallRecorder()
         self.transcript = CallTranscript()
+        # Langfuse generations/tools for this call (the ADK instrumentor skips run_live).
+        self.call_tracer = CallTracer(settings.VOICE_MODEL)
         # Set from the first live event (see ``_send_ready``).
         self.output_rate: int | None = None
         self.chunker: audio.OutboundChunker | None = None
@@ -180,13 +196,38 @@ class CallBridge:
     async def run(self) -> None:
         log.info("Call %s from %s started", self.call_id, self.phone)
         try:
-            try:
-                self.conv_id = await conversations.start_call(
-                    self.phone, self.call_id, self.started_at
-                )
-            except Exception:
-                log.exception("Could not open conversation for call %s", self.call_id)
+            self.conv_id = await conversations.start_call(
+                self.phone, self.call_id, self.started_at
+            )
+        except Exception:
+            log.exception("Could not open conversation for call %s", self.call_id)
 
+        # One Langfuse trace per call, in the call's conversation session. The
+        # up/downstream tasks inherit its context, so ADK's spans nest under it.
+        with observability.trace_root(
+            "handle-voice-call",
+            phone=self.phone,
+            channel="voice",
+            session_id=self.conv_id,
+            metadata={"call_id": self.call_id, "conversation_id": self.conv_id},
+        ) as obs:
+            await self._run()
+            update: dict = {
+                # Role-labelled messages render as a readable conversation in Langfuse.
+                "output": _transcript_messages(self.transcript.turns),
+                "metadata": {
+                    "duration_sec": round((datetime.now(UTC) - self.started_at).total_seconds()),
+                    "ended_by": self.end_reason or self.stop_reason or "closed",
+                    "turns": len(self.transcript.turns),
+                    "tools": [c.get("name") for c in self.recorder.calls],
+                },
+            }
+            if self.end_reason == protocol.END_ERROR:
+                update |= {"level": "ERROR", "status_message": f"call ended: {self.end_reason}"}
+            obs.update(**update)
+
+    async def _run(self) -> None:
+        try:
             history = await get_history(self.phone) if self.phone else []
             await self.runner.session_service.create_session(
                 app_name=self.runner.app_name, user_id=self.user_id, session_id=self.session_id
@@ -198,6 +239,7 @@ class CallBridge:
             log.exception("Call %s failed", self.call_id)
             self.end_reason = protocol.END_ERROR
         finally:
+            self.call_tracer.close(self.end_reason or self.stop_reason)
             self.queue.close()
             if self.end_reason:
                 with contextlib.suppress(Exception):
@@ -323,14 +365,17 @@ class CallBridge:
             if text:
                 if role == "user":
                     self.transcript.user(text)
+                    self.call_tracer.caller_said(text)
                 else:
                     self.transcript.assistant(text)
+                    self.call_tracer.agent_said(text)
                 await self._send_transcript(role, text, final=True)
         elif tr.text:
             self.partial[role] += tr.text
             await self._send_transcript(role, self.partial[role].strip(), final=False)
 
     async def _on_event(self, event: Any) -> None:
+        self.call_tracer.observe(event)
         content = getattr(event, "content", None)
         blobs = [
             blob

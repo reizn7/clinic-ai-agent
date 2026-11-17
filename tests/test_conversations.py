@@ -155,3 +155,34 @@ def test_idle_timeout_rotates_conversation(db):
     # The first was finalized (info_provided → completed), the new one is active.
     assert docs[0]["status"] == "completed"
     assert docs[1]["status"] == "active"
+
+
+# ---- conversation id resolved before a turn (Langfuse session id) -----------
+
+
+def test_resolved_id_names_the_new_conversation(db):
+    cid = conv._resolve_conversation_id_sync("919")
+    assert cid.startswith("conv_")
+    assert db["conversations"].count_documents({}) == 0  # read-only
+
+    recorded = conv._record_turn_sync("919", "hi", "hello", [], 100, cid)
+    assert recorded == cid
+    assert db["conversations"].find_one({"phone": "+919"})["externalId"] == cid
+
+
+def test_resolved_id_is_the_open_conversation(db):
+    first = conv._record_turn_sync("919", "hi", "hello", [], 100)
+    assert conv._resolve_conversation_id_sync("919") == first
+    # A turn in the same window stays in that conversation, whatever id is hinted.
+    assert conv._record_turn_sync("919", "again", "ok", [], 100, first) == first
+
+
+def test_resolved_id_is_fresh_after_idle_window(db):
+    first = conv._record_turn_sync("919", "hi", "hello", [INFO_OK], 100)
+    doc = db["conversations"].find_one({"externalId": first})
+    doc["messages"][-1]["timestamp"] = (datetime.now(UTC) - timedelta(minutes=45)).isoformat()
+    db["conversations"].update_one({"externalId": first}, {"$set": {"messages": doc["messages"]}})
+
+    cid = conv._resolve_conversation_id_sync("919")
+    assert cid != first
+    assert conv._record_turn_sync("919", "back", "welcome", [], 100, cid) == cid

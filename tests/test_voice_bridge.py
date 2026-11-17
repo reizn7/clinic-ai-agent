@@ -15,6 +15,7 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from starlette.websockets import WebSocketDisconnect
 
+from clinic_agent import observability
 from clinic_agent.runtime import conversations, history
 from clinic_agent.voice import bridge, protocol
 
@@ -243,7 +244,9 @@ async def test_full_call(db):
     assert len(blobs) == 2
     assert all(b.mime_type == "audio/pcm;rate=16000" for b in blobs)
     assert blobs[0].data == _pcm(16000, 0.1)  # forwarded untouched
-    assert runner.run_kwargs["user_id"] == PHONE
+    # ADK's user_id is only a session key; it's the hashed patient id (no phone in traces).
+    assert runner.run_kwargs["user_id"] == observability.adk_user_id(PHONE, fallback="")
+    assert PHONE not in runner.run_kwargs["user_id"]
     assert socket.closed
 
     # --- downstream: ready first, native-rate media, clear on barge-in ---

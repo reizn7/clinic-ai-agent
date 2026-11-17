@@ -14,6 +14,7 @@ load_dotenv()
 from fastapi import FastAPI  # noqa: E402
 
 from clinic_agent.config import settings  # noqa: E402
+from clinic_agent.observability import init_tracing, shutdown_tracing  # noqa: E402
 from clinic_agent.runtime import flusher, sweeper  # noqa: E402
 from clinic_agent.whatsapp.webhook import router as webhook_router  # noqa: E402
 
@@ -33,10 +34,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        # Flush any buffered spans to Langfuse before the process exits.
+        shutdown_tracing()
 
 
 def create_app() -> FastAPI:
     logging.basicConfig(level=settings.LOG_LEVEL)
+    # Langfuse tracing (no-op unless LANGFUSE_ENABLED + keys). ADK's own OTel spans
+    # are picked up from here on.
+    init_tracing()
     app = FastAPI(title="Clinic AI Agent v2", lifespan=lifespan)
 
     @app.get("/")

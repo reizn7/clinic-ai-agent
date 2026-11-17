@@ -22,7 +22,7 @@ log = logging.getLogger("clinic_agent.runtime.flusher")
 async def _flush_one(phone: str, messages: list[str]) -> None:
     combined = "\n".join(messages)
     try:
-        reply = await run_turn(phone, combined)
+        reply = await run_turn(phone, combined, bubbles=len(messages))
         await send_text_message(phone, reply)
         log.info("flushed %d bubble(s) for %s", len(messages), phone)
     except Exception:

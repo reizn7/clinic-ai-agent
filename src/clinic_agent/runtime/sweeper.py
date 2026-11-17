@@ -13,6 +13,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
+from clinic_agent import observability
 from clinic_agent.config import settings
 from clinic_agent.runtime import analytics, conversations
 
@@ -35,7 +36,17 @@ async def run_once() -> None:
 
     batch = await asyncio.to_thread(conversations.claim_analytics_batch, stuck_cutoff, _BATCH)
     for external_id, transcript in batch:
-        result = await asyncio.to_thread(analytics.generate_analytics, transcript)
+        with observability.trace_root(
+            "analyze-conversation",
+            channel="analytics",
+            session_id=external_id,
+            metadata={"conversation_id": external_id},
+        ) as obs:
+            result = await asyncio.to_thread(analytics.generate_analytics, transcript)
+            obs.update(
+                output=result.model_dump() if result else None,
+                **({} if result else {"level": "WARNING", "status_message": "no analytics"}),
+            )
         await asyncio.to_thread(conversations.apply_analytics, external_id, result)
         log.info(
             "sweeper: analytics %s for %s",

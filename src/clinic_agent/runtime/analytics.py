@@ -19,6 +19,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+from clinic_agent import observability
 from clinic_agent.config import settings
 
 log = logging.getLogger("clinic_agent.runtime.analytics")
@@ -68,19 +69,31 @@ def generate_analytics(transcript: str) -> ConversationAnalytics | None:
     """One structured Gemini call → analytics, or None on empty input / failure."""
     if not transcript.strip():
         return None
-    try:
-        resp = _get_client().models.generate_content(
-            model=settings.MODEL,
-            contents=_PROMPT.format(transcript=transcript),
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                response_mime_type="application/json",
-                response_schema=ConversationAnalytics,
-                thinking_config=_minimal_thinking(),
-            ),
-        )
-        parsed = resp.parsed
-        return parsed if isinstance(parsed, ConversationAnalytics) else None
-    except Exception:
-        log.exception("analytics generation failed")
-        return None
+    prompt = _PROMPT.format(transcript=transcript)
+    with observability.generation(
+        "generate-conversation-analytics",
+        model=settings.MODEL,
+        input=prompt,
+        model_parameters={"temperature": 0.2},
+    ) as gen:
+        try:
+            resp = _get_client().models.generate_content(
+                model=settings.MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=ConversationAnalytics,
+                    thinking_config=_minimal_thinking(),
+                ),
+            )
+            parsed = resp.parsed
+            gen.update(
+                output=resp.text,
+                usage_details=observability.usage_details(resp.usage_metadata),
+            )
+            return parsed if isinstance(parsed, ConversationAnalytics) else None
+        except Exception as exc:
+            log.exception("analytics generation failed")
+            gen.update(level="ERROR", status_message=repr(exc))
+            return None

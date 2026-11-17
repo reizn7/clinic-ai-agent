@@ -305,42 +305,77 @@ def apply_analytics(external_id: str, result: ConversationAnalytics | None) -> N
 # ---- the writer -----------------------------------------------------------
 
 
+def _new_conversation_id() -> str:
+    return f"conv_{uuid.uuid4().hex}"
+
+
+def _is_stale(conv: dict, now: datetime) -> bool:
+    """True once the idle window has elapsed since the conversation's last message."""
+    msgs = conv.get("messages", [])
+    if not msgs:
+        return False
+    try:
+        last_ts = datetime.fromisoformat(msgs[-1]["timestamp"])
+    except (ValueError, KeyError, TypeError):
+        return False
+    return now - last_ts > IDLE_TIMEOUT
+
+
+def _latest_active_whatsapp(col: Any, e164: str) -> dict | None:
+    # Voice calls are their own conversations; never append WhatsApp turns to one.
+    return col.find_one(
+        {"phone": e164, "status": "active", "channel": {"$ne": VOICE_CHANNEL}},
+        sort=[("startedAt", -1)],
+    )
+
+
+def _resolve_conversation_id_sync(phone: str) -> str:
+    """The id the NEXT WhatsApp turn from ``phone`` will be recorded under.
+
+    Read-only: the open conversation's id if it is still inside the idle window,
+    otherwise a fresh id that ``record_turn(..., conversation_id=)`` will create
+    the conversation with. Lets a turn be traced under its conversation (the
+    Langfuse session) before the turn runs.
+    """
+    conv = _latest_active_whatsapp(get_db()[COLLECTION], _to_e164(phone))
+    if conv and not _is_stale(conv, datetime.now(UTC)):
+        return conv["externalId"]
+    return _new_conversation_id()
+
+
+async def resolve_conversation_id(phone: str) -> str:
+    return await asyncio.to_thread(_resolve_conversation_id_sync, phone)
+
+
 def _record_turn_sync(
     phone: str,
     patient_text: str,
     agent_reply: str,
     tool_calls: list[dict],
     latency_ms: int | None,
-) -> None:
+    conversation_id: str | None = None,
+) -> str:
+    """Record one turn; return the conversation's ``externalId``.
+
+    ``conversation_id`` (from ``resolve_conversation_id``) names the conversation
+    if a new one has to be started.
+    """
     col = get_db()[COLLECTION]
     now = datetime.now(UTC)
     e164 = _to_e164(phone)
 
-    # Voice calls are their own conversations; never append WhatsApp turns to one.
-    conv = col.find_one(
-        {"phone": e164, "status": "active", "channel": {"$ne": VOICE_CHANNEL}},
-        sort=[("startedAt", -1)],
-    )
-
-    if conv:
-        msgs = conv.get("messages", [])
-        last_ts = None
-        if msgs:
-            try:
-                last_ts = datetime.fromisoformat(msgs[-1]["timestamp"])
-            except (ValueError, KeyError, TypeError):
-                last_ts = None
-        if last_ts and now - last_ts > IDLE_TIMEOUT:
-            # Idle window elapsed → finalize the stale conversation, start fresh.
-            col.update_one(
-                {"externalId": conv["externalId"]},
-                {"$set": {"status": _final_status(_calls_from_messages(msgs))}},
-            )
-            conv = None
+    conv = _latest_active_whatsapp(col, e164)
+    if conv and _is_stale(conv, now):
+        # Idle window elapsed → finalize the stale conversation, start fresh.
+        col.update_one(
+            {"externalId": conv["externalId"]},
+            {"$set": {"status": _final_status(_calls_from_messages(conv.get("messages", [])))}},
+        )
+        conv = None
 
     if conv is None:
         conv = {
-            "externalId": f"conv_{uuid.uuid4().hex}",
+            "externalId": conversation_id or _new_conversation_id(),
             "clinicId": settings.CLINIC_ID,
             "channel": CHANNEL,
             "phone": e164,
@@ -373,6 +408,7 @@ def _record_turn_sync(
             },
         },
     )
+    return conv["externalId"]
 
 
 async def record_turn(
@@ -381,10 +417,17 @@ async def record_turn(
     agent_reply: str,
     tool_calls: list[dict],
     latency_ms: int | None,
-) -> None:
+    conversation_id: str | None = None,
+) -> str:
     """Append one turn to the phone's open conversation (creating/rotating it)."""
-    await asyncio.to_thread(
-        _record_turn_sync, phone, patient_text, agent_reply, tool_calls, latency_ms
+    return await asyncio.to_thread(
+        _record_turn_sync,
+        phone,
+        patient_text,
+        agent_reply,
+        tool_calls,
+        latency_ms,
+        conversation_id,
     )
 
 
