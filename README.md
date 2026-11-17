@@ -359,6 +359,28 @@ Timestamps are stored as ISO strings.
 `run_once()` closes idle conversations, then (if `ANALYTICS_ENABLED`) claims a batch
 of 10 and applies analytics. `run_forever()` survives tick failures.
 
+### `runtime/outbox.py`, `runtime/followups.py`, `integrations/google_calendar.py`
+**Appointment follow-ups.** Every successful book / reschedule / cancel queues jobs
+in the `outbox` collection; a worker started in the app lifespan delivers them, so a
+slow or failing Google/Meta call never blocks the conversation.
+- `calendar.sync` makes the doctor's Google Calendar match the appointment: create,
+  move, or delete the event. Event ids are deterministic per appointment, so retries
+  are idempotent. Doctors without a `calendarEmail` are skipped.
+- `whatsapp.notify` sends the patient a fixed-text confirmation (or a Meta template,
+  if configured) built from the **stored** appointment, never from model output. It
+  is skipped if the booking was cancelled before it went out.
+- Confirmations are **held** until the agent's WhatsApp reply has been sent, or until
+  the voice call ends (`outbox.held(token)` around the turn/call), then released.
+  Holds nobody released (a crash) are released after 60 min.
+- Several unsent changes to one appointment collapse into one accurate message:
+  booked + rescheduled sends a single "confirmed" with the new time; booked +
+  cancelled sends nothing.
+- Retries: transient errors back off 30 s → 8 min, up to 6 attempts. Permanent errors
+  (calendar not shared, WhatsApp rejection) fail at once with a readable `lastError`.
+- Outcomes are written onto the appointment (`calendarSync`, `confirmation`) for the
+  console, and each job is a Langfuse trace (`sync-doctor-calendar`,
+  `send-appointment-confirmation`).
+
 ### `tools/repo.py`
 Synchronous Mongo data access, ported from v1's Mongoose services. Key behaviours:
 - **Every query is scoped to `CLINIC_ID`** and every insert stamps it: several clinics
@@ -549,6 +571,35 @@ by the seed / migration scripts.
 It backfills `clinicId` on old documents, creates the scoped indexes and drops the
 legacy phone-only unique indexes. Until it runs, documents without a `clinicId` are
 invisible to the agent.
+
+### Setting up appointment follow-ups
+
+**Google Calendar** (`GOOGLE_CALENDAR_ENABLED=true`):
+1. In Google Cloud: create a project, enable the **Google Calendar API**, and create
+   a **service account** with a JSON key. There's no need to grant it any IAM role.
+2. Set `GOOGLE_SERVICE_ACCOUNT_FILE=/path/key.json` (or put the JSON in
+   `GOOGLE_SERVICE_ACCOUNT_JSON`) and `CLINIC_TIMEZONE`.
+3. Each doctor opens Google Calendar → *Settings and sharing* → *Share with specific
+   people*, adds the service account's email (`…@….iam.gserviceaccount.com`) with
+   **Make changes to events**, and staff enter that calendar's email as the doctor's
+   *Google Calendar email* in the console.
+
+**WhatsApp confirmations** (`WHATSAPP_CONFIRMATIONS_ENABLED=true`, the default):
+WhatsApp chats work with plain text. To also reach **voice callers** (outside the 24-h
+window), create these *Utility* templates in Meta Business Manager and set their
+names in `WHATSAPP_TEMPLATE_*`:
+
+| Setting | Suggested template body |
+|---|---|
+| `WHATSAPP_TEMPLATE_BOOKED` | `Hi {{1}}, your appointment with {{2}} on {{3}} at {{4}} is confirmed. Your booking reference is {{5}}. Reply to this message if you need to reschedule or cancel.` |
+| `WHATSAPP_TEMPLATE_RESCHEDULED` | `Hi {{1}}, your appointment with {{2}} at {{4}} has been moved to {{3}}. Your booking reference is {{5}}. Reply to this message if you need to make another change.` |
+| `WHATSAPP_TEMPLATE_CANCELLED` | `Hi {{1}}, your appointment with {{2}} on {{3}} at {{4}} has been cancelled. Reply to this message whenever you would like to book again.` |
+
+Create them with **Number** variables (not Name), **no buttons**, and the language
+whose code matches `WHATSAPP_TEMPLATE_LANGUAGE` (`en` = "English").
+
+Check a doctor's calendar sharing without booking anything:
+`uv run python scripts/check_calendar.py <calendar email>`.
 
 ---
 

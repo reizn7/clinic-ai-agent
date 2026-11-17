@@ -15,7 +15,7 @@ from fastapi import FastAPI  # noqa: E402
 
 from clinic_agent.config import settings  # noqa: E402
 from clinic_agent.observability import init_tracing, shutdown_tracing  # noqa: E402
-from clinic_agent.runtime import flusher, sweeper  # noqa: E402
+from clinic_agent.runtime import flusher, outbox, sweeper  # noqa: E402
 from clinic_agent.whatsapp.webhook import router as webhook_router  # noqa: E402
 
 
@@ -25,7 +25,11 @@ def _ensure_indexes() -> None:
     from clinic_agent.runtime import conversations, debounce
     from clinic_agent.tools import repo
 
-    for ensure in (repo.ensure_indexes, conversations.ensure_indexes, debounce.ensure_indexes):
+    for ensure in (
+        repo.ensure_indexes,
+        conversations.ensure_indexes,
+        debounce.ensure_indexes,
+    ):
         try:
             ensure()
         except Exception:
@@ -38,6 +42,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     tasks = [
         asyncio.create_task(sweeper.run_forever()),
         asyncio.create_task(flusher.run_forever()),
+        # Appointment follow-ups: doctor calendar sync + WhatsApp confirmations.
+        asyncio.create_task(outbox.run_forever()),
     ]
     try:
         yield

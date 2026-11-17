@@ -46,7 +46,7 @@ from starlette.websockets import WebSocketDisconnect
 from clinic_agent import observability
 from clinic_agent.config import settings
 from clinic_agent.phone import is_valid_phone, normalize_phone
-from clinic_agent.runtime import conversations
+from clinic_agent.runtime import conversations, outbox
 from clinic_agent.runtime.agent import build_agent
 from clinic_agent.runtime.history import append_turn, get_history
 from clinic_agent.runtime.tool_capture import ToolCallRecorder
@@ -194,6 +194,11 @@ class CallBridge:
     # ---- lifecycle --------------------------------------------------------
 
     async def run(self) -> None:
+        # Booking confirmations queued during the call go out after it ends.
+        with outbox.held(f"call:{self.call_id}"):
+            await self._run_traced()
+
+    async def _run_traced(self) -> None:
         log.info("Call %s from %s started", self.call_id, self.phone)
         try:
             self.conv_id = await conversations.start_call(

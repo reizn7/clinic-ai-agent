@@ -17,6 +17,7 @@ dependencies = [
     "certifi>=2024.0",
     "langfuse>=5.2.0",
     "openinference-instrumentation-google-adk>=1.1.6",
+    "google-auth[requests]>=2.40",
 ]
 
 [project.scripts]

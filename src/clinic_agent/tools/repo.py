@@ -21,6 +21,7 @@ from pymongo.errors import DuplicateKeyError
 
 from clinic_agent.config import settings
 from clinic_agent.db import create_index_safe, get_db
+from clinic_agent.runtime import outbox
 from clinic_agent.tools import catalog
 from clinic_agent.tools.slots import available_slots, generate_slots
 
@@ -65,11 +66,23 @@ def ensure_indexes() -> None:
         name="uniq_clinic_phone",
     )
     create_index_safe(
-        get_db()["doctors"], [("clinicId", 1), ("isActive", 1), ("name", 1)],
+        get_db()["doctors"],
+        [("clinicId", 1), ("isActive", 1), ("name", 1)],
         name="clinic_active_name",
     )
     create_index_safe(get_db()["clinic"], "clinicId", unique=True, name="uniq_clinic")
     catalog.ensure_indexes()
+    outbox.ensure_indexes()
+
+
+def _followups(appointment_id: ObjectId, event: str) -> dict:
+    """Queue calendar sync + patient confirmation; tell the model what to expect."""
+    outbox.enqueue_appointment_change(appointment_id, event)
+    if settings.WHATSAPP_CONFIRMATIONS_ENABLED:
+        return {
+            "whatsapp_confirmation": "A written confirmation will be sent to the patient on WhatsApp."
+        }
+    return {}
 
 
 def _scoped(query: dict | None = None) -> dict:
@@ -268,6 +281,7 @@ def create_appointment(
         "weekday": _weekday_name(date_key),
         "slot": slot,
         "status": "Pending",
+        **_followups(res.inserted_id, "booked"),
     }
 
 
@@ -296,23 +310,31 @@ def list_patient_appointments(phone: str) -> list[dict]:
 def cancel_appointment(appointment_id: str) -> dict:
     try:
         oid = ObjectId(appointment_id)
-    except (InvalidId, TypeError):
+    except InvalidId, TypeError:
         return {"success": False, "error": "Invalid appointment id."}
     now = datetime.now(UTC)
     res = get_db()["appointments"].update_one(
-        _scoped({"_id": oid}),
+        _scoped({"_id": oid, "status": {"$ne": "Cancelled"}}),
         {"$set": {"status": "Cancelled", "cancelledAt": now, "updatedAt": now}},
     )
     if res.matched_count == 0:
+        if get_db()["appointments"].find_one(_scoped({"_id": oid})):
+            # Already cancelled: idempotent success, no second notification.
+            return {"success": True, "appointmentId": appointment_id, "status": "Cancelled"}
         return {"success": False, "error": "Appointment not found."}
-    return {"success": True, "appointmentId": appointment_id, "status": "Cancelled"}
+    return {
+        "success": True,
+        "appointmentId": appointment_id,
+        "status": "Cancelled",
+        **_followups(oid, "cancelled"),
+    }
 
 
 def reschedule_appointment(appointment_id: str, new_date: str, new_slot: str) -> dict:
     """Move an existing (non-cancelled) appointment to a new date + slot."""
     try:
         oid = ObjectId(appointment_id)
-    except (InvalidId, TypeError):
+    except InvalidId, TypeError:
         return {"success": False, "error": "Invalid appointment id."}
 
     appt = get_db()["appointments"].find_one(_scoped({"_id": oid}))
@@ -346,4 +368,5 @@ def reschedule_appointment(appointment_id: str, new_date: str, new_slot: str) ->
         "weekday": _weekday_name(new_date),
         "slot": new_slot,
         "status": appt["status"],
+        **_followups(oid, "rescheduled"),
     }

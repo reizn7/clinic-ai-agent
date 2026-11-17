@@ -7,6 +7,35 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from clinic_agent import observability
 
+_DB_MODULES = [
+    "clinic_agent.db",
+    "clinic_agent.runtime.conversations",
+    "clinic_agent.runtime.debounce",
+    "clinic_agent.runtime.followups",
+    "clinic_agent.runtime.history",
+    "clinic_agent.runtime.outbox",
+    "clinic_agent.tools.catalog",
+    "clinic_agent.tools.repo",
+]
+
+
+@pytest.fixture(autouse=True)
+def _no_real_mongo(monkeypatch):
+    """Safety net: every module's ``get_db`` points at an in-memory mongomock DB.
+
+    The real database is shared with the live agent and the console, so no test
+    may ever reach it. Tests that need specific data still patch ``get_db`` with
+    their own fake; anything they don't patch lands here instead of in Atlas.
+    """
+    import importlib
+
+    import mongomock
+
+    fake = mongomock.MongoClient()["safety-net"]
+    for name in _DB_MODULES:
+        monkeypatch.setattr(importlib.import_module(name), "get_db", lambda: fake)
+    return fake
+
 
 @pytest.fixture(scope="session")
 def _langfuse_memory():

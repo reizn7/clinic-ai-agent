@@ -60,6 +60,24 @@ class Settings(BaseSettings):
     VOICE_NAME: str = ""  # optional prebuilt voice, e.g. "Kore"; empty = model default
     VOICE_WS_TOKEN: str = ""  # optional shared secret; if set, open /voice/call?token=<it>
 
+    # --- Appointment follow-ups (outbox worker) ---
+    # The clinic's local timezone: appointment date+slot are local times.
+    CLINIC_TIMEZONE: str = "Asia/Kolkata"
+    # Google Calendar: a service account each doctor shares their calendar with
+    # ("Make changes to events"). Doctors without a calendarEmail are skipped.
+    GOOGLE_CALENDAR_ENABLED: bool = False
+    GOOGLE_SERVICE_ACCOUNT_FILE: str = ""  # path to the service account JSON key
+    GOOGLE_SERVICE_ACCOUNT_JSON: str = ""  # or the key JSON itself (e.g. a secret env var)
+    # WhatsApp confirmations to the patient after book / reschedule / cancel.
+    WHATSAPP_CONFIRMATIONS_ENABLED: bool = True
+    # Approved Meta template names (needed outside the 24h window, e.g. after a
+    # voice call). Empty = send plain text instead.
+    WHATSAPP_TEMPLATE_BOOKED: str = ""
+    WHATSAPP_TEMPLATE_RESCHEDULED: str = ""
+    WHATSAPP_TEMPLATE_CANCELLED: str = ""
+    WHATSAPP_TEMPLATE_LANGUAGE: str = "en"
+    OUTBOX_TICK_SECONDS: float = 2.0
+
     # --- Tracing (Langfuse, OpenTelemetry-based) ---
     # Off unless enabled AND both keys are set; the app never needs Langfuse to run.
     LANGFUSE_ENABLED: bool = False

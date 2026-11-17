@@ -7,12 +7,13 @@ echo; Milestone 2 swaps ``_handle_message`` for the ADK agent turn.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response
 
 from clinic_agent.config import settings
-from clinic_agent.runtime import debounce
+from clinic_agent.runtime import debounce, outbox
 from clinic_agent.runtime.turn import run_turn
 from clinic_agent.whatsapp.client import send_text_message
 
@@ -47,8 +48,10 @@ def _extract_message(body: dict[str, Any]) -> dict[str, Any] | None:
 async def _reply(phone: str, text: str) -> None:
     """Run the agent for one message and deliver its reply."""
     try:
-        reply = await run_turn(phone, text)
-        await send_text_message(phone, reply)
+        # Booking confirmations queued during the turn go out after the reply.
+        with outbox.held(f"wa:{uuid.uuid4().hex}"):
+            reply = await run_turn(phone, text)
+            await send_text_message(phone, reply)
         log.info("Reply sent to %s", phone)
     except Exception:
         log.exception("Failed to handle message from %s", phone)

@@ -24,13 +24,45 @@ def _messages_url() -> str:
 
 async def send_text_message(to: str, body: str) -> dict:
     """Send a plain-text WhatsApp message. Returns the Graph API response JSON."""
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to,
-        "type": "text",
-        "text": {"preview_url": False, "body": body},
-    }
+    return await _send(
+        {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "text",
+            "text": {"preview_url": False, "body": body},
+        }
+    )
+
+
+async def send_template_message(
+    to: str, template: str, language: str, body_params: list[str]
+) -> dict:
+    """Send an approved template message (allowed outside the 24h window).
+
+    ``body_params`` fill the template body's {{1}}, {{2}}, … in order.
+    """
+    return await _send(
+        {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": template,
+                "language": {"code": language},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [{"type": "text", "text": p} for p in body_params],
+                    }
+                ],
+            },
+        }
+    )
+
+
+async def _send(payload: dict) -> dict:
     headers = {
         "Authorization": f"Bearer {settings.ACCESS_TOKEN}",
         "Content-Type": "application/json",
