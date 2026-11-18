@@ -248,7 +248,6 @@ src/clinic_agent/
     static/call.html     the browser call page (vanilla JS, AudioWorklets, no build step)
 scripts/
   seed.py                idempotent: 1 clinic + 2 doctors + all indexes
-  seed_demo.py           DESTRUCTIVE: wipes data, seeds 7 doctors, sample patients + appointments
   seed_hospital.py       insert-only: hospital-scale data (about, 14 more doctors, Staff, Services & charges, Subsidies & schemes)
   smoke_live.py          live end-to-end check (real Mongo + Gemini, no WhatsApp send)
   voice_sim.py           local call-page simulator: streams WAV / `say` audio, saves replies to out.wav
@@ -691,8 +690,6 @@ Copy `.env.example` to `.env`. All settings live in
 uv sync
 cp .env.example .env                  # fill in the values above
 uv run python scripts/seed.py         # idempotent: clinic + 2 doctors + indexes
-# or, for a richer demo dataset (WIPES this CLINIC_ID's patients/appointments/conversations/transcripts/pending_messages/clinic/doctors):
-# uv run python scripts/seed_demo.py
 uv run python scripts/seed_hospital.py  # optional, insert-only: realistic hospital data
 uv run medi-desk-ai                   # serves on :$PORT (default 3000)
 ```
@@ -704,9 +701,6 @@ uv run medi-desk-ai                   # serves on :$PORT (default 3000)
   appointments. It also adds example clinic-configured data (doctor degrees /
   experience / languages, and a "Lab tests" catalog with 4 tests), inserted only if
   missing so console edits are never overwritten.
-- `seed_demo.py`: 7 doctors across specialties (General Physician, Dentist,
-  Pediatrician, Cardiologist, Dermatologist, Orthopedic Surgeon, Gynecologist), a few
-  sample patients, and existing `Confirmed` appointments on upcoming working days.
 - `seed_hospital.py`: turns the clinic into a realistic 150-bed multi-speciality
   hospital. It fills the clinic's `about` and adds clinic fields (emergency, ambulance
   helpline, visiting hours, beds, specialities, facilities, insurance/TPAs, payment
