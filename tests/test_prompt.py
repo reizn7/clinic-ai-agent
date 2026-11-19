@@ -67,7 +67,10 @@ async def test_build_agent_channels(monkeypatch) -> None:
     # No catalogs configured → each channel's prompt is exactly its static prompt.
     monkeypatch.setattr(catalog, "prompt_section", lambda: "")
     wa = build_agent()
-    assert wa.model == settings.MODEL
+    # Text model = MODEL first (with retries), then any MODEL_FALLBACKS.
+    primary = wa.model.models[0] if hasattr(wa.model, "models") else wa.model
+    assert primary.model == settings.MODEL
+    assert primary.retry_options.attempts >= 1
     assert await wa.instruction(None) == SYSTEM_PROMPT
     voice = build_agent("voice")
     assert voice.model == settings.VOICE_MODEL

@@ -100,7 +100,11 @@ def _final_text(event) -> str:
     parts = getattr(content, "parts", None) if content else None
     if not parts:
         return ""
-    return "".join(getattr(p, "text", "") or "" for p in parts)
+    # Skip reasoning parts: reasoning models (e.g. gpt-oss on the Groq fallback)
+    # surface their chain of thought as ``thought=True`` text, never for patients.
+    return "".join(
+        getattr(p, "text", "") or "" for p in parts if not getattr(p, "thought", False)
+    )
 
 
 async def run_turn(phone: str, message: str, *, bubbles: int = 1) -> str:

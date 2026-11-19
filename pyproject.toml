@@ -18,6 +18,7 @@ dependencies = [
     "langfuse>=5.2.0",
     "openinference-instrumentation-google-adk>=1.1.6",
     "google-auth[requests]>=2.40",
+    "litellm>=1.110.1",
 ]
 
 [project.scripts]

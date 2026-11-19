@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     GOOGLE_API_KEY: str = ""
     GOOGLE_GENAI_USE_VERTEXAI: bool = False
     MODEL: str = "gemini-3.5-flash-lite"
+    # Comma-separated backups tried in order when MODEL is overloaded/erroring
+    # (429/5xx). Empty = no fallback. ``groq:<model>`` runs on Groq (needs
+    # GROQ_API_KEY; skipped without it), anything else is a Gemini model.
+    # gpt-oss-20b: the 120b's ~5k-token requests blow Groq's free 8k TPM cap
+    # on the second call of a tool-using turn.
+    MODEL_FALLBACKS: str = "gemini-3.5-flash,groq:openai/gpt-oss-20b"
+    GROQ_API_KEY: str = ""
+    # Attempts per model (incl. the first) on 408/429/5xx, with exp. backoff.
+    MODEL_RETRY_ATTEMPTS: int = 3
 
     # --- Storage (MongoDB) ---
     MONGO_URI: str = Field(

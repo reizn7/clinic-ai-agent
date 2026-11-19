@@ -58,7 +58,14 @@ from clinic_agent.voice.call_trace import CallTracer
 log = logging.getLogger("clinic_agent.voice.bridge")
 
 APP_NAME = "medi-desk-ai-voice"
-GREETING_CUE = "The caller has just connected. Greet them as the clinic receptionist."
+# Hardcoded for our single prod hospital (avoids a DB read before the greeting).
+# TODO: read clinicName from the clinic record once there is more than one.
+HOSPITAL_NAME = "CityCare Multi-Speciality Clinic"
+GREETING_CUE = (
+    "The caller has just connected. Greet them as the receptionist of "
+    f"{HOSPITAL_NAME}: say this name in your greeting "
+    f'(e.g. "Hello, {HOSPITAL_NAME}, how can I help you?").'
+)
 MODEL_INPUT_MIME = f"audio/pcm;rate={audio.MODEL_INPUT_RATE}"
 # After a hangup, wait this long for an in-flight tool call (e.g. a booking) to
 # return so its result is recorded.

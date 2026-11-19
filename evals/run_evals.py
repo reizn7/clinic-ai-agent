@@ -58,6 +58,7 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
+import httpx  # noqa: E402
 from google import genai  # noqa: E402
 from google.genai import errors as genai_errors  # noqa: E402
 from google.genai import types as genai_types  # noqa: E402
@@ -76,14 +77,17 @@ from voice_driver import run_voice_call  # noqa: E402
 
 SCENARIOS = ROOT / "evals" / "scenarios.json"
 DATASET_NAME = "whatsapp-agent-scenarios"
-JUDGE_MODEL = os.environ.get("EVAL_JUDGE_MODEL", "gemini-3.8-flash")
+JUDGE_MODEL = os.environ.get("EVAL_JUDGE_MODEL", "groq:openai/gpt-oss-120b")
 # Tried in order when the judge model is overloaded (429/5xx after retries).
 JUDGE_MODELS = [JUDGE_MODEL] + [
     m
-    for m in os.environ.get("EVAL_JUDGE_FALLBACKS", "gemini-3.7-flash,gemini-3.5-flash").split(",")
+    for m in os.environ.get("EVAL_JUDGE_FALLBACKS", "gemini-3.5-flash,gemma-4-26b-a4b-it,gemini-3.8-flash").split(",")
     if m and m != JUDGE_MODEL
 ]
 JUDGE_ATTEMPTS = 3
+JUDGE_ROUNDS = 4  # passes over JUDGE_MODELS before giving up
+TURN_TIMEOUT_SECONDS = 120  # per WhatsApp agent turn
+TURN_ATTEMPTS = 3
 JUDGE_TIMEOUT_SECONDS = 90
 PHONE_PREFIX = "1555"
 
@@ -229,7 +233,18 @@ async def _whatsapp_task(phone: str, inp: dict, setup: dict | None, say) -> dict
         say(f"  patient: {msg}")
         conv_id = await conversations.resolve_conversation_id(phone)
         t0 = time.perf_counter()
-        reply, tool_calls, failed = await turn._run_turn(phone, msg, conv_id)
+        # The model call has no timeout of its own; an overloaded API can leave
+        # it hanging forever, so cap each turn and retry it.
+        for attempt in range(TURN_ATTEMPTS):
+            try:
+                reply, tool_calls, failed = await asyncio.wait_for(
+                    turn._run_turn(phone, msg, conv_id), timeout=TURN_TIMEOUT_SECONDS
+                )
+                break
+            except TimeoutError:
+                say(f"  agent turn timed out (attempt {attempt + 1}/{TURN_ATTEMPTS})")
+        else:
+            reply, tool_calls, failed = "", [], True
         failed_turns += int(failed)
         all_tools.extend(tool_calls)
         tools = [c.get("name") for c in tool_calls]
@@ -450,40 +465,109 @@ def _render_conversation(transcript: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _parse_judge(text: str) -> dict:
+    """JSON from the judge; tolerates a ```json fence or prose around the object."""
+    start, end = text.find("{"), text.rfind("}")
+    v = json.loads(text[start : end + 1] if start != -1 else text)
+    missing = [k for k in JUDGE_SCHEMA["required"] if k not in v]
+    if missing:
+        raise ValueError(f"judge reply missing {missing}")
+    return v
+
+
+async def _groq_generate(model: str, prompt: str) -> str:
+    """One judge call to Groq's OpenAI-compatible API with a strict JSON schema."""
+    schema = {**JUDGE_SCHEMA, "additionalProperties": False}
+    schema["required"] = list(JUDGE_SCHEMA["properties"])
+    async with httpx.AsyncClient(timeout=JUDGE_TIMEOUT_SECONDS) as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"},
+            json={
+                "model": model,
+                "temperature": 0,
+                # Groq counts the reserved reply against the 8k tokens/min free
+                # limit; the default is large enough that long transcripts never fit.
+                "max_completion_tokens": 1500,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "verdict", "strict": True, "schema": schema},
+                },
+            },
+        )
+    if r.status_code != 200:
+        raise _JudgeBusy(r.status_code, r.headers.get("retry-after"), r.text[:200])
+    return r.json()["choices"][0]["message"]["content"]
+
+
+async def _gemini_generate(model: str, prompt: str) -> str:
+    assert _judge_client is not None
+    config = genai_types.GenerateContentConfig(temperature=0)
+    if model.startswith("gemma"):  # no JSON mode / response schema: ask in the prompt
+        prompt = (
+            f"{prompt}\nRespond with ONLY a JSON object (no markdown) with keys "
+            f"{list(JUDGE_SCHEMA['properties'])}; *_pass/grounded/style_ok are "
+            "booleans, *_reason are short strings."
+        )
+    else:
+        config.response_mime_type = "application/json"
+        config.response_json_schema = JUDGE_SCHEMA
+    resp = await _judge_client.aio.models.generate_content(
+        model=model, contents=prompt, config=config
+    )
+    return resp.text
+
+
+class _JudgeBusy(Exception):
+    def __init__(self, code: int, retry_after: str | None, body: str):
+        super().__init__(f"{code}: {body}")
+        self.code = code
+        self.retry_after = float(retry_after) if retry_after else None
+
+
+RETRYABLE = (429, 500, 502, 503, 504, 498, "timeout", "bad json")
+
+
 async def _judge_call(prompt: str, item_id: str) -> tuple[dict, str]:
     """Ask the judge, riding out overload: retry each model with backoff on
-    429/5xx, then fall back to the next model in ``JUDGE_MODELS``."""
-    assert _judge_client is not None
+    429/5xx, fall back through ``JUDGE_MODELS``, and repeat the whole list for
+    ``JUDGE_ROUNDS`` rounds before giving up. ``groq:<model>`` uses Groq."""
     last: Exception | None = None
-    for model in JUDGE_MODELS:
-        for attempt in range(JUDGE_ATTEMPTS):
-            try:
-                # Hard cap: an overloaded model can also just never answer.
-                resp = await asyncio.wait_for(
-                    _judge_client.aio.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                        config=genai_types.GenerateContentConfig(
-                            temperature=0,
-                            response_mime_type="application/json",
-                            response_json_schema=JUDGE_SCHEMA,
-                        ),
-                    ),
-                    timeout=JUDGE_TIMEOUT_SECONDS,
-                )
-                return json.loads(resp.text), model
-            except (genai_errors.APIError, TimeoutError) as exc:
-                code = getattr(exc, "code", "timeout")
-                if code not in (429, 500, 502, 503, 504, "timeout"):
-                    raise
-                last = exc
-                wait = 2 ** (attempt + 1) + random.random()
-                progress(
-                    f"[{item_id}] judge {model} busy ({code}), "
-                    f"attempt {attempt + 1}/{JUDGE_ATTEMPTS}, retrying in {wait:.0f}s"
-                )
-                await asyncio.sleep(wait)
-        progress(f"[{item_id}] judge {model} unavailable, falling back")
+    for rnd in range(JUDGE_ROUNDS):
+        for model in JUDGE_MODELS:
+            for attempt in range(JUDGE_ATTEMPTS):
+                try:
+                    # Hard cap: an overloaded model can also just never answer.
+                    if model.startswith("groq:"):
+                        call = _groq_generate(model.removeprefix("groq:"), prompt)
+                    else:
+                        call = _gemini_generate(model, prompt)
+                    text = await asyncio.wait_for(call, timeout=JUDGE_TIMEOUT_SECONDS)
+                    return _parse_judge(text), model
+                except (
+                    genai_errors.APIError, _JudgeBusy, TimeoutError, httpx.HTTPError, ValueError
+                ) as exc:
+                    if isinstance(exc, ValueError):
+                        code = "bad json"
+                    elif isinstance(exc, httpx.HTTPError):
+                        code = "timeout"
+                    else:
+                        code = getattr(exc, "code", "timeout")
+                    if code not in RETRYABLE:
+                        raise
+                    last = exc
+                    wait = getattr(exc, "retry_after", None) or 2 ** (attempt + 1)
+                    wait = min(wait, 60) + random.random()
+                    progress(
+                        f"[{item_id}] judge {model} busy ({code}), round {rnd + 1}/"
+                        f"{JUDGE_ROUNDS} attempt {attempt + 1}/{JUDGE_ATTEMPTS}, "
+                        f"retrying in {wait:.0f}s"
+                    )
+                    await asyncio.sleep(wait)
+            progress(f"[{item_id}] judge {model} unavailable, falling back")
+        if rnd + 1 < JUDGE_ROUNDS:
+            await asyncio.sleep(30)
     raise RuntimeError(f"all judge models unavailable: {JUDGE_MODELS}") from last
 
 
