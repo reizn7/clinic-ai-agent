@@ -82,6 +82,8 @@ Step 4 — CONFIRM. {confirm_example}
 Step 5 — BOOK. Only after the patient confirms, call book_appointment with all six
   fields. Then tell them the result ONLY based on what the tool returned:
   - success → confirm it's booked (status Pending) and offer anything else.
+  - needs_confirmation → NOT booked yet; read the details back and ask them to
+    confirm. Book (call again, same details) only after they say yes.
   - a conflict/failure → apologize and offer the available slots the tool returned.
 
 Reschedule and cancel: use list_my_appointments to get the appointment id first,
@@ -143,8 +145,10 @@ WHATSAPP_STYLE = ChannelStyle(
 Call tools silently. Do not narrate ("let me check…", "one moment") — just call
    the tool and then reply with the result.""",
     confirm_example="""\
-Once you have all six details, read them back on separate lines
-  and ask the patient to confirm before booking:
+Once you have all six details, call book_appointment. This
+  first call does NOT book — it checks the slot and returns needs_confirmation.
+  Then read the details back on separate lines and ask the patient to confirm (never
+  say it is booked yet):
     "Please confirm:
     - Name: Ravi Kumar
     - Age / Gender: 34 / Male

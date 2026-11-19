@@ -180,3 +180,35 @@ def test_reschedule_rejects_unavailable_slot(db):
     booked = repo.create_appointment("919", "Ravi", 30, "Male", "Asha Mehta", MON, "09:30")
     res = repo.reschedule_appointment(booked["appointmentId"], SUN, "09:00")  # off day
     assert res["success"] is False
+
+
+def test_confirmation_gate_needs_a_later_turn(db):
+    phone = "919999999999"
+    # First call: not booked, asks for confirmation.
+    first = repo.confirmation_gate(phone, "Asha Mehta", MON, "09:30", "turn-1")
+    assert first["needs_confirmation"] is True and first["booked"] is False
+    # Same turn again (model calling twice before the patient replied): still gated.
+    assert repo.confirmation_gate(phone, "Asha Mehta", MON, "09:30", "turn-1")
+    # Different details in a later turn: re-proposed, not booked.
+    assert repo.confirmation_gate(phone, "Asha Mehta", MON, "10:00", "turn-2")
+    # Same details as the latest proposal, in a later turn → go ahead (once).
+    assert repo.confirmation_gate(phone, "dr. asha mehta", MON, "10:00", "turn-3") is None
+    assert repo.confirmation_gate(phone, "Asha Mehta", MON, "10:00", "turn-4")
+
+
+def test_confirmation_gate_passes_through_unbookable_slots(db):
+    # create_appointment reports these, so the gate stays out of the way.
+    assert repo.confirmation_gate("919999999999", "Nobody", MON, "09:30", "t") is None
+    assert repo.confirmation_gate("919999999999", "Asha Mehta", SUN, "09:30", "t") is None
+
+
+def test_rebooking_own_slot_is_idempotent(db):
+    phone = "919999999999"
+    first = repo.create_appointment(phone, "Ravi", 30, "Male", "Asha Mehta", MON, "09:30")
+    again = repo.create_appointment(phone, "Ravi", 30, "Male", "Asha Mehta", MON, "09:30")
+    assert again["success"] is True and again["alreadyBooked"] is True
+    assert again["appointmentId"] == first["appointmentId"]
+    assert len(repo.list_patient_appointments(phone)) == 1
+    # Someone else still can't take it.
+    other = repo.create_appointment("918888888888", "Asha", 40, "Female", "Asha Mehta", MON, "09:30")
+    assert other["success"] is False

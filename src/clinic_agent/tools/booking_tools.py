@@ -111,8 +111,11 @@ async def book_appointment(
     slot: str,
     tool_context: ToolContext,
 ) -> dict:
-    """Book an appointment after the patient has confirmed the details. The
-    caller's phone number is attached automatically.
+    """Book an appointment. The caller's phone number is attached automatically.
+
+    On WhatsApp the first call for a slot does NOT book: it checks the slot and
+    returns needs_confirmation. Read the details back, and once the patient says
+    yes in their next message, call again with the same details to book.
 
     Args:
         patient_name: The patient's full name.
@@ -125,6 +128,14 @@ async def book_appointment(
     phone = _caller(tool_context)
     if not phone:
         return _NO_CALLER
+    if tool_context.state.get(CHANNEL) != "voice":
+        # WhatsApp: one turn per patient message (invocation_id), so the gate can
+        # require a reply between the read-back and the booking.
+        gate = await asyncio.to_thread(
+            repo.confirmation_gate, phone, doctor_name, date, slot, tool_context.invocation_id
+        )
+        if gate:
+            return gate
     result = await asyncio.to_thread(
         repo.create_appointment,
         phone,

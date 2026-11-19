@@ -15,9 +15,10 @@ from clinic_agent.prompt import (
 # change it by accident; update both values only for a deliberate WhatsApp change.
 # Last deliberate change: workingDays rule, privacy/verify_caller section, tools
 # no longer take a phone argument; handoff: already_requested, and on WhatsApp the
-# AI stops after escalating (staff take over the chat in the console).
-_PRE_SPLIT_SHA256 = "bbd811e58f674eff1486f337046f1c8c55f7f47e061e77f203e125661b83a38a"
-_PRE_SPLIT_LEN = 7372
+# AI stops after escalating (staff take over the chat in the console); booking:
+# first book_appointment returns needs_confirmation, book on the patient's yes.
+_PRE_SPLIT_SHA256 = "7870498e09e6c83dc4bc13faf62be2778138ec284688c4121626ffbf74a01cf9"
+_PRE_SPLIT_LEN = 7657
 
 
 def test_whatsapp_prompt_unchanged() -> None:

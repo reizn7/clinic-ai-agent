@@ -45,9 +45,10 @@ def db(_no_real_mongo, monkeypatch):
     return _no_real_mongo
 
 
-def ctx(phone: str = ME, channel: str = "voice") -> SimpleNamespace:
-    """Stand-in for ADK's ToolContext: the tools only use ``.state``."""
-    return SimpleNamespace(state={CALLER_PHONE: phone, CHANNEL: channel})
+def ctx(phone: str = ME, channel: str = "voice", turn: str = "turn-1") -> SimpleNamespace:
+    """Stand-in for ADK's ToolContext: the tools use ``.state`` (and, for the
+    WhatsApp booking confirmation gate, ``.invocation_id`` = one turn)."""
+    return SimpleNamespace(state={CALLER_PHONE: phone, CHANNEL: channel}, invocation_id=turn)
 
 
 def _book_for(phone: str, name: str = "Ravi Kumar", slot: str = "14:00") -> dict:
@@ -190,9 +191,13 @@ async def test_unverified_voice_booking_keeps_existing_patient_details(db):
 
 async def test_whatsapp_booking_still_updates_patient_details(db):
     _book_for(ME, "Ravi Kumar")
-    await booking_tools.book_appointment(
-        "Ravi K. Sharma", 34, "Male", "Rohit Sharma", MON, "15:00", ctx(ME, "whatsapp")
-    )
+    args = ("Ravi K. Sharma", 34, "Male", "Rohit Sharma", MON, "15:00")
+    # Turn 1 only proposes (read-back); turn 2 — the patient's yes — books.
+    first = await booking_tools.book_appointment(*args, ctx(ME, "whatsapp", "turn-1"))
+    assert first["needs_confirmation"] is True
+    assert db["patients"].find_one({"phone": ME})["name"] == "Ravi Kumar"
+    booked = await booking_tools.book_appointment(*args, ctx(ME, "whatsapp", "turn-2"))
+    assert booked["success"] is True
     assert db["patients"].find_one({"phone": ME})["name"] == "Ravi K. Sharma"
 
 

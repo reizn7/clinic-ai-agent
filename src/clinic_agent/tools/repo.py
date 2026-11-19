@@ -269,6 +269,21 @@ def create_appointment(
     if not doctor:
         return {"success": False, "error": f"No active doctor named '{doctor_name}'."}
 
+    # Idempotent: a repeat call for a slot this patient already holds returns
+    # that appointment instead of "slot just taken" (their own booking).
+    mine = _own_booking(phone, doctor["_id"], date_key, slot)
+    if mine:
+        return {
+            "success": True,
+            "alreadyBooked": True,
+            "appointmentId": str(mine["_id"]),
+            "doctor": doctor["name"],
+            "date": date_key,
+            "weekday": _weekday_name(date_key),
+            "slot": slot,
+            "status": mine.get("status", "Pending"),
+        }
+
     # Validate the slot is genuinely bookable (future, a working day, a real free
     # slot) before writing — clearer than relying on the unique index alone.
     avail = get_available_slots(doctor_name, date_key)
@@ -309,6 +324,88 @@ def create_appointment(
         "slot": slot,
         "status": "Pending",
         **_followups(res.inserted_id, "booked"),
+    }
+
+
+def _own_booking(phone: str, doctor_id, date_key: str, slot: str) -> dict | None:
+    patient = get_db()["patients"].find_one(_scoped({"phone": phone}), {"_id": 1})
+    if not patient:
+        return None
+    return get_db()["appointments"].find_one(
+        _scoped(
+            {
+                "patientId": patient["_id"],
+                "doctorId": doctor_id,
+                "date": date_key,
+                "slot": slot,
+                "status": {"$in": ACTIVE_STATUSES},
+            }
+        )
+    )
+
+
+# --- Booking confirmation gate (WhatsApp) -----------------------------------
+# The prompt says "read back, wait for yes, then book", but a small model can
+# book and ask in the same turn. So the first book_appointment for a slot only
+# records a proposal; it books when called again, for the same doctor/date/slot,
+# in a LATER turn (i.e. after the patient has replied).
+
+PROPOSAL_TTL = timedelta(minutes=30)
+
+
+def confirmation_gate(
+    phone: str, doctor_name: str, date_key: str, slot: str, turn_id: str
+) -> dict | None:
+    """``None`` → go ahead and book. A dict → NOT booked; ask the patient first."""
+    doctor = _find_doctor_by_name(doctor_name)
+    if not doctor or slot not in get_available_slots(doctor_name, date_key).get("slots", []):
+        # Unknown doctor / unavailable or already-own slot: create_appointment
+        # reports it (or returns the existing booking).
+        return None
+
+    col = get_db()["booking_proposals"]
+    query = _scoped({"phone": phone})
+    now = datetime.now(UTC)
+    prop = col.find_one(query)
+    if prop:
+        created = prop["createdAt"]
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        if (
+            (prop["doctorId"], prop["date"], prop["slot"]) == (doctor["_id"], date_key, slot)
+            and prop["turnId"] != turn_id
+            and created > now - PROPOSAL_TTL
+        ):
+            col.delete_one({"_id": prop["_id"]})
+            return None
+
+    col.update_one(
+        query,
+        {
+            "$set": {
+                "doctorId": doctor["_id"],
+                "date": date_key,
+                "slot": slot,
+                "turnId": turn_id,
+                "createdAt": now,
+            }
+        },
+        upsert=True,
+    )
+    return {
+        "success": False,
+        "booked": False,
+        "needs_confirmation": True,
+        "doctor": doctor["name"],
+        "date": date_key,
+        "weekday": _weekday_name(date_key),
+        "slot": slot,
+        "message": (
+            "NOT booked yet — the slot is free. Read the details back to the patient "
+            "and ask them to confirm. Do not say it is booked. When they say yes in "
+            "their next message, call book_appointment again with the same doctor, "
+            "date and slot."
+        ),
     }
 
 
