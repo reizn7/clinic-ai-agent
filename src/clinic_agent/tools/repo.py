@@ -101,7 +101,13 @@ def _today_key() -> str:
     return clinic_today().isoformat()
 
 
-def get_clinic() -> dict:
+def get_clinic(detail: str = "") -> dict:
+    """Basic clinic info + the names of its extra details; or one detail's value.
+
+    Extra details (insurers, payment modes, facilities, …) are fields staff add
+    in the console, so only their names are listed by default; ``detail`` picks
+    the ones to read, keeping the reply short.
+    """
     doc = get_db()["clinic"].find_one(_scoped()) or DEFAULT_CLINIC
     info = {
         "clinicName": doc.get("clinicName", ""),
@@ -112,9 +118,18 @@ def get_clinic() -> dict:
     details = catalog.render_attributes(
         catalog.get_definitions().get("clinic"), doc.get("attributes"), where="clinic"
     )
-    if details:
-        info["details"] = details
-    return info
+    if not (detail or "").strip():
+        if details:
+            info["available_details"] = list(details)
+        return info
+    picked = catalog.pick_details(details, detail)
+    if not picked:
+        return {
+            **info,
+            "error": f"No clinic detail matching '{detail}'.",
+            "available_details": list(details),
+        }
+    return {**info, "details": picked}
 
 
 def list_active_doctors() -> list[dict]:

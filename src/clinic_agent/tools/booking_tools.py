@@ -70,9 +70,17 @@ def _booked_this_call(tool_context: ToolContext) -> list[str]:
     return list(tool_context.state.get(BOOKED_THIS_CALL) or [])
 
 
-async def get_clinic_info() -> dict:
-    """Get the clinic's name, opening timings, address, and contact phone number."""
-    return await asyncio.to_thread(repo.get_clinic)
+async def get_clinic_info(detail: str = "") -> dict:
+    """Get the clinic's name, opening timings, address and contact phone number,
+    plus ``available_details``: the names of the other details the clinic has
+    (e.g. insurers / TPAs accepted, payment modes, facilities, specialities,
+    visiting hours, parking). Call again with ``detail`` to read one of them.
+
+    Args:
+        detail: Optional. The name of one detail to read (e.g. "insurance",
+            "payment modes", "parking"); empty for the basic info.
+    """
+    return await asyncio.to_thread(repo.get_clinic, detail)
 
 
 async def list_doctors() -> dict:

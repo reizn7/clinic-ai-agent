@@ -179,18 +179,46 @@ def _resolve_catalog(name: str, defs: dict[str, dict]) -> str | None:
     return None
 
 
+_PUNCT_RE = re.compile(r"[^\w\s]+")
+
+
+def _norm(text: str) -> str:
+    """Lowercase with punctuation turned into spaces ("Check-up" → "check up")."""
+    return " ".join(_PUNCT_RE.sub(" ", text.lower()).split())
+
+
 def _searchable_text(item: dict) -> str:
+    """Normalized text plus a no-spaces copy, so "checkup" finds "check-up"."""
     parts: list[str] = []
     for v in item.values():
         if isinstance(v, str):
             parts.append(v)
         elif isinstance(v, list):
             parts.extend(x for x in v if isinstance(x, str))
-    return " ".join(parts).lower()
+    spaced = _norm(" ".join(parts))
+    return f"{spaced} {spaced.replace(' ', '')}"
+
+
+def _query_terms(query: str) -> list[str]:
+    """Normalized, de-spaced words; punctuation inside a word is dropped."""
+    return [w for w in (_PUNCT_RE.sub("", t) for t in (query or "").lower().split()) if w]
+
+
+def _term_hits(term: str, text: str) -> bool:
+    """Substring match, also trying the singular of a plural ("checkups")."""
+    if term in text:
+        return True
+    return len(term) > 3 and term.endswith("s") and term[:-1] in text
 
 
 def search_catalog(catalog: str, query: str = "", clinic_id: str | None = None) -> dict:
-    """Search one agent-enabled custom page; return up to ``SEARCH_LIMIT`` rows."""
+    """Search one agent-enabled custom page; return up to ``SEARCH_LIMIT`` rows.
+
+    Every query word must match (ignoring case, punctuation and hyphens). If no
+    row matches them all, the rows matching the most words come back instead,
+    flagged ``partial_match`` — speech-to-text and patients rarely use the
+    clinic's exact wording.
+    """
     clinic_id = clinic_id or settings.CLINIC_ID
     enabled = {c["catalog"] for c in agent_catalogs(clinic_id)}
     defs = {k: v for k, v in get_definitions(clinic_id).items() if k in enabled}
@@ -218,34 +246,91 @@ def search_catalog(catalog: str, query: str = "", clinic_id: str | None = None) 
         if item:
             items.append(item)
 
-    terms = [t for t in re.split(r"\s+", (query or "").lower()) if t]
-    matches = [i for i in items if all(t in _searchable_text(i) for t in terms)]
-    matches.sort(key=lambda i: str(i.get("name", "")).lower())
-    return {
+    def by_name(i: dict) -> str:
+        return str(i.get("name", "")).lower()
+
+    terms = _query_terms(query)
+    scored = []
+    for item in items:
+        text = _searchable_text(item)
+        scored.append((sum(_term_hits(t, text) for t in terms), item))
+
+    matches = sorted((i for n, i in scored if n == len(terms)), key=by_name)
+    result = {
         "catalog": etype,
         "label": definition.get("label") or etype,
         "query": query,
-        "total_matches": len(matches),
-        "results": matches[:SEARCH_LIMIT],
     }
+    if not matches and len(terms) > 1:
+        best = max(n for n, _ in scored) if scored else 0
+        if best:
+            partial = sorted((i for n, i in scored if n == best), key=by_name)
+            return {
+                **result,
+                "partial_match": True,
+                "note": "Nothing matched every word; these are the closest items. "
+                "Check they are what the patient means before answering.",
+                "total_matches": len(partial),
+                "results": partial[:SEARCH_LIMIT],
+            }
+    return {**result, "total_matches": len(matches), "results": matches[:SEARCH_LIMIT]}
+
+
+# ---- clinic details ---------------------------------------------------------------
+
+
+def clinic_detail_fields(clinic_id: str | None = None) -> list[dict]:
+    """Agent-visible fields staff added to the clinic page, in order."""
+    return visible_fields(get_definitions(clinic_id).get("clinic"))
+
+
+def pick_details(details: dict, wanted: str) -> dict:
+    """The subset of ``{label: value}`` that ``wanted`` refers to.
+
+    Matches the label as a phrase either way round ("insurance" →
+    "Insurance / TPAs accepted (cashless)"), then falls back to any shared word
+    of 4+ letters, so a loose topic name still finds the right detail.
+    """
+    q = _norm(wanted)
+    if not q:
+        return {}
+    hits = {k: v for k, v in details.items() if q in _norm(k) or _norm(k) in q}
+    if hits:
+        return hits
+    words = {w for w in q.split() if len(w) >= 4}
+    return {k: v for k, v in details.items() if words & set(_norm(k).split())}
 
 
 # ---- prompt section -------------------------------------------------------------
 
 
 def prompt_section(clinic_id: str | None = None) -> str:
-    """'What this clinic offers' text for the system prompt ("" if nothing)."""
+    """Clinic-specific prompt text: catalogs + clinic detail topics ("" if none)."""
+    sections = []
     catalogs = agent_catalogs(clinic_id)
-    if not catalogs:
-        return ""
-    lines = [
-        "# Clinic catalogs",
-        "Besides doctors and appointments, this clinic has these catalogs. When a patient "
-        "asks about one (availability, price, preparation, …), call search_catalog with the "
-        "catalog name and a short query, and answer ONLY from what it returns. If nothing "
-        "matches, say the clinic doesn't list it and offer to connect them to staff.",
-    ]
-    for c in catalogs:
-        desc = f" — {c['description']}" if c["description"] else ""
-        lines.append(f"- {c['catalog']} ({c['label']}){desc}")
-    return "\n".join(lines)
+    if catalogs:
+        lines = [
+            "# Clinic catalogs",
+            "Besides doctors and appointments, this clinic has these catalogs. When a patient "
+            "asks about one (availability, price, preparation, …), call search_catalog with the "
+            "catalog name and a short query, and answer ONLY from what it returns. If nothing "
+            "matches, try a shorter or differently worded query (and the clinic details below) "
+            "before saying the clinic doesn't list it; then offer to connect them to staff.",
+        ]
+        for c in catalogs:
+            desc = f" — {c['description']}" if c["description"] else ""
+            lines.append(f"- {c['catalog']} ({c['label']}){desc}")
+        sections.append("\n".join(lines))
+
+    labels = [f.get("label") or f["key"] for f in clinic_detail_fields(clinic_id)]
+    if labels:
+        lines = [
+            "# Clinic details",
+            "Beyond name, timings, address and phone, the clinic has these details. To read "
+            "one, call get_clinic_info with detail set to its name (e.g. which insurers are "
+            "accepted, payment modes, parking). Check them before saying the clinic doesn't "
+            "offer or accept something.",
+        ]
+        lines.extend(f"- {label}" for label in labels)
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)

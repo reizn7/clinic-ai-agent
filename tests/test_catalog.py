@@ -172,6 +172,46 @@ def test_search_unknown_or_disabled_catalog_lists_the_available_ones(db):
         assert res["available_catalogs"] == ["lab_test"]
 
 
+def _service_records(db):
+    db["records"].insert_many(
+        [
+            {
+                "clinicId": CLINIC,
+                "entityType": "lab_test",
+                "isActive": True,
+                "attributes": {"name": "Basic health check-up", "price": 1999},
+            },
+            {
+                "clinicId": CLINIC,
+                "entityType": "lab_test",
+                "isActive": True,
+                "attributes": {"name": "Basic life support ambulance", "price": 1500},
+            },
+        ]
+    )
+
+
+def test_search_ignores_hyphens_and_punctuation(db):
+    _service_records(db)
+    for q in ("basic health checkup", "health check up", "Health Check-Up", "checkups"):
+        res = catalog.search_catalog("lab_test", q)
+        assert [i["name"] for i in res["results"]] == ["Basic health check-up"], q
+        assert "partial_match" not in res
+
+
+def test_search_falls_back_to_closest_partial_matches(db):
+    _service_records(db)
+    res = catalog.search_catalog("lab_test", "basic health screening")
+    assert res["partial_match"] is True
+    assert [i["name"] for i in res["results"]] == ["Basic health check-up"]
+
+
+def test_search_with_no_word_matching_returns_nothing(db):
+    _service_records(db)
+    res = catalog.search_catalog("lab_test", "mri brain")
+    assert res["total_matches"] == 0 and "partial_match" not in res
+
+
 def test_prompt_section_lists_agent_enabled_catalogs(db):
     text = catalog.prompt_section()
     assert "search_catalog" in text
@@ -243,4 +283,61 @@ def test_clinic_info_is_scoped_with_details(db):
     )
     info = repo.get_clinic()
     assert info["clinicName"] == "Sunrise"
-    assert info["details"] == {"Parking": "Free, basement"}
+    assert info["available_details"] == ["Parking"]
+    assert "details" not in info
+    assert repo.get_clinic("parking")["details"] == {"Parking": "Free, basement"}
+
+
+def _clinic_with_insurers(db):
+    db["entity_definitions"].insert_one(
+        {
+            "clinicId": CLINIC,
+            "entityType": "clinic",
+            "kind": "system",
+            "fields": [
+                _field("insuranceAccepted", "tags", label="Insurance / TPAs accepted (cashless)"),
+                _field("paymentModes", "tags", label="Payment modes", order=1),
+            ],
+        }
+    )
+    catalog.clear_cache()
+    db["clinic"].insert_one(
+        {
+            "clinicId": CLINIC,
+            "clinicName": "Sunrise",
+            "attributes": {
+                "insuranceAccepted": ["Star Health", "Tata AIG"],
+                "paymentModes": ["UPI", "Cashless insurance"],
+            },
+        }
+    )
+
+
+def test_clinic_info_reads_one_detail_by_loose_name(db):
+    _clinic_with_insurers(db)
+    assert repo.get_clinic()["available_details"] == [
+        "Insurance / TPAs accepted (cashless)",
+        "Payment modes",
+    ]
+    for wanted in ("insurance", "insurers accepted", "TPAs", "Insurance / TPAs accepted"):
+        info = repo.get_clinic(wanted)
+        assert info["details"] == {
+            "Insurance / TPAs accepted (cashless)": ["Star Health", "Tata AIG"]
+        }, wanted
+    assert repo.get_clinic("payment")["details"] == {
+        "Payment modes": ["UPI", "Cashless insurance"]
+    }
+
+
+def test_clinic_info_unknown_detail_lists_the_available_ones(db):
+    _clinic_with_insurers(db)
+    info = repo.get_clinic("wifi")
+    assert "error" in info and "details" not in info
+    assert info["available_details"] == ["Insurance / TPAs accepted (cashless)", "Payment modes"]
+
+
+def test_prompt_section_lists_clinic_detail_topics(db):
+    _clinic_with_insurers(db)
+    text = catalog.prompt_section()
+    assert "# Clinic details" in text and "get_clinic_info" in text
+    assert "- Insurance / TPAs accepted (cashless)" in text
