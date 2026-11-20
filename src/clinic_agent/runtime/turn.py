@@ -11,13 +11,13 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime
 from typing import Literal
 
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 
 from clinic_agent import observability
+from clinic_agent.clinic_time import clinic_now
 from clinic_agent.runtime import conversations
 from clinic_agent.runtime.agent import build_agent
 from clinic_agent.runtime.history import append_turn, get_history
@@ -49,7 +49,7 @@ def contextualize(
     (the message is the bridge's cue, not something the patient said); the
     WhatsApp output is unchanged.
     """
-    now = datetime.now()
+    now = clinic_now()
     header = (
         "## Context\n"
         f"Today's date is {now:%A, %B %d, %Y} (use it to resolve relative dates "

@@ -13,12 +13,13 @@ in each document's ``attributes``; only agent-visible ones are returned
 from __future__ import annotations
 
 import re
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo.errors import DuplicateKeyError
 
+from clinic_agent.clinic_time import clinic_now, clinic_today
 from clinic_agent.config import settings
 from clinic_agent.db import create_index_safe, get_db
 from clinic_agent.runtime import outbox
@@ -97,7 +98,7 @@ def _weekday_name(date_key: str) -> str:
 
 
 def _today_key() -> str:
-    return date.today().isoformat()
+    return clinic_today().isoformat()
 
 
 def get_clinic() -> dict:
@@ -194,6 +195,11 @@ def get_available_slots(doctor_name: str, date_key: str) -> dict:
             {"slot": 1},
         )
     ]
+    if date_key == _today_key():
+        # Today: a slot that has already started can't be booked. "HH:mm" strings
+        # compare correctly as text.
+        now_hhmm = f"{clinic_now():%H:%M}"
+        all_slots = [s for s in all_slots if s > now_hhmm]
     return {
         "doctor": doctor["name"],
         "date": date_key,
@@ -210,7 +216,7 @@ def get_upcoming_availability(doctor_name: str, count: int = 3) -> dict:
         return {"error": f"No active doctor named '{doctor_name}'."}
 
     results: list[dict] = []
-    cursor = date.today()
+    cursor = clinic_today()
     guard = 0
     while len(results) < count and guard < 60:
         cursor += timedelta(days=1)

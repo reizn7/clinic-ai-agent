@@ -346,7 +346,7 @@ conversation, with no extra LLM call, using the same logic for both channels:
 | `outcome` | `appointment_rescheduled` (reschedule succeeded, or book + cancel) › `appointment_booked` › `appointment_cancelled` › `escalated` › `info_provided` (clinic info/doctors/my-appointments) › `no_resolution` |
 | `intents` / `primaryIntent` | Mapped from tool names in order of first use: `book_appointment`, `cancel_appointment`, `reschedule_appointment`, `doctor_availability` (check/find), `clinic_info` (clinic info / doctors), `other` |
 | `doctorName` | `doctor_name` arg of the last `book_appointment`/`check_availability` call |
-| `appointmentAt` | `date`+`slot` of the last successful booking as a **naive local** ISO datetime |
+| `appointmentAt` | `date`+`slot` of the last successful booking, read in `CLINIC_TIMEZONE`, as a UTC ISO datetime |
 | `escalated` / `escalationReason` | Successful `escalate_to_human` call and its `reason` arg |
 | `status` | `active` while chatting (even after escalation). When closed: `escalated`, `abandoned` (outcome `no_resolution`), or `completed` |
 
@@ -889,9 +889,9 @@ Keep these true when changing the code:
   the patient's last message; the console disables the reply box after that. A
   staff-handled chat stays silent until someone resolves its escalation (there is no
   automatic timeout).
-- **Timezone:** "today", past-date checks, and `appointmentAt` use the **server's
-  local time**, with no clinic timezone configured. Deploy with the clinic's TZ or add
-  one.
+- **Timezone:** "today", past-date/past-slot checks, `appointmentAt` and calendar
+  events all use `CLINIC_TIMEZONE` (via `clinic_agent/clinic_time.py`), never the
+  server's local clock, so a UTC container is fine.
 - **Two idle timeouts:** conversation rotation in `record_turn` uses a hardcoded
   30-minute `IDLE_TIMEOUT` in `conversations.py`, while the sweeper uses
   `IDLE_TIMEOUT_MINUTES`. Keep them aligned.

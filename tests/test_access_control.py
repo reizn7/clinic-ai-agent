@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 
+from clinic_agent.clinic_time import clinic_today
 from clinic_agent.config import settings
 from clinic_agent.runtime.tool_capture import ToolCallRecorder
 from clinic_agent.tools import access_code, booking_tools, repo
@@ -17,7 +18,7 @@ OTHER = "918888888888"
 
 
 def _next(py_weekday: int) -> str:
-    d = date.today() + timedelta(days=1)
+    d = clinic_today() + timedelta(days=1)
     while d.weekday() != py_weekday:
         d += timedelta(days=1)
     return d.isoformat()

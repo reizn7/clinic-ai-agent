@@ -76,7 +76,7 @@ async def test_finish_call_writes_turns_and_derived_fields(db):
     assert doc["primaryIntent"] == "book_appointment"
     assert doc["intents"] == ["doctor_availability", "book_appointment"]
     assert doc["doctorName"] == "Asha Mehta"
-    assert doc["appointmentAt"] == "2026-11-16T10:30:00"
+    assert doc["appointmentAt"] == "2026-11-16T05:00:00+00:00"
     assert doc["escalated"] is False
     assert 94 <= doc["durationSec"] <= 97
 

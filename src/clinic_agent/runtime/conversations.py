@@ -16,9 +16,8 @@ console degrades gracefully without them.
 
 DESIGN NOTES / judgement calls (flag for the console team):
   * Timestamps are ISO 8601 UTC strings.
-  * ``appointmentAt`` is built from the booked date+slot as a NAIVE local
-    datetime (no clinic timezone configured yet) — revisit once a clinic TZ is
-    available if the console needs true UTC.
+  * ``appointmentAt`` is the booked date+slot, read in the clinic's timezone
+    (``CLINIC_TIMEZONE``) and stored as UTC like every other timestamp.
   * A conversation is closed LAZILY: the next inbound from the same phone after
     the idle window finalizes the previous one (completed/abandoned/escalated).
     A trailing conversation with no follow-up stays ``active`` until a future
@@ -36,6 +35,7 @@ from bson import ObjectId
 from pymongo import ReturnDocument
 
 from clinic_agent import observability
+from clinic_agent.clinic_time import slot_start
 from clinic_agent.config import settings
 from clinic_agent.db import create_index_safe, get_db
 from clinic_agent.phone import to_e164
@@ -164,7 +164,7 @@ def _appointment_at(calls: list[dict]) -> str | None:
             date, slot = args.get("date"), args.get("slot")
             if date and slot:
                 try:
-                    return datetime.fromisoformat(f"{date}T{slot}").isoformat()
+                    return slot_start(date, slot).astimezone(UTC).isoformat()
                 except ValueError:
                     return None
     return None

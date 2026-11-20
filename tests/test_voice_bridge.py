@@ -296,7 +296,7 @@ async def test_full_call(db):
     assert c["status"] == "completed"
     assert c["outcome"] == "appointment_booked"
     assert c["doctorName"] == "Asha Mehta"
-    assert c["appointmentAt"] == "2026-11-16T10:30:00"
+    assert c["appointmentAt"] == "2026-11-16T05:00:00+00:00"
     assert isinstance(c["durationSec"], int)
     tool_msgs = [m for m in c["messages"] if m["type"] == "tool_call"]
     assert tool_msgs[0]["tool"]["name"] == "book_appointment"

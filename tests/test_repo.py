@@ -1,9 +1,10 @@
-from datetime import date, timedelta
+from datetime import timedelta
 
 import mongomock
 import pytest
 from bson import ObjectId
 
+from clinic_agent.clinic_time import clinic_today
 from clinic_agent.config import settings
 from clinic_agent.tools import catalog, repo
 
@@ -34,7 +35,7 @@ def db(monkeypatch):
 
 def _next_weekday(py_weekday: int) -> str:
     """The next FUTURE date (from tomorrow) matching a Python weekday (Mon=0)."""
-    d = date.today() + timedelta(days=1)
+    d = clinic_today() + timedelta(days=1)
     for _ in range(14):
         if d.weekday() == py_weekday:
             return d.isoformat()
@@ -44,7 +45,7 @@ def _next_weekday(py_weekday: int) -> str:
 
 MON = _next_weekday(0)  # a future Monday (doctor works)
 SUN = _next_weekday(6)  # a future Sunday (doctor off)
-PAST = (date.today() - timedelta(days=1)).isoformat()
+PAST = (clinic_today() - timedelta(days=1)).isoformat()
 
 
 def test_list_active_doctors(db):
@@ -212,3 +213,17 @@ def test_rebooking_own_slot_is_idempotent(db):
     # Someone else still can't take it.
     other = repo.create_appointment("918888888888", "Asha", 40, "Female", "Asha Mehta", MON, "09:30")
     assert other["success"] is False
+
+
+def test_today_hides_slots_that_already_started(db, monkeypatch):
+    from datetime import datetime
+
+    from clinic_agent.clinic_time import clinic_tz
+
+    monday = datetime.fromisoformat(f"{MON}T09:45").replace(tzinfo=clinic_tz())
+    monkeypatch.setattr(repo, "clinic_now", lambda: monday)
+    monkeypatch.setattr(repo, "clinic_today", lambda: monday.date())
+    res = repo.get_available_slots("Asha Mehta", MON)
+    assert res["slots"] == ["10:00", "10:30"]
+    booked = repo.create_appointment("919999999999", "Ravi", 30, "Male", "Asha Mehta", MON, "09:30")
+    assert booked["success"] is False

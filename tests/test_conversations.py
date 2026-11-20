@@ -98,7 +98,7 @@ def test_first_turn_creates_conversation_with_contract_shape(db):
     assert doc["outcome"] == "appointment_booked"
     assert doc["primaryIntent"] == "book_appointment"
     assert doc["doctorName"] == "Asha Mehta"
-    assert doc["appointmentAt"] == "2026-10-14T09:30:00"
+    assert doc["appointmentAt"] == "2026-10-14T04:00:00+00:00"
 
     roles = [(m["role"], m["type"]) for m in doc["messages"]]
     assert roles == [("patient", "text"), ("agent", "tool_call"), ("agent", "text")]

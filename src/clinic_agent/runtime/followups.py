@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime, timedelta
 
 from bson import ObjectId
 
+from clinic_agent.clinic_time import slot_start
 from clinic_agent.config import settings
 from clinic_agent.db import get_db
 from clinic_agent.integrations import google_calendar
@@ -63,8 +63,7 @@ class Snapshot:
 
     @property
     def start(self) -> datetime:
-        tz = ZoneInfo(settings.CLINIC_TIMEZONE)
-        return datetime.strptime(f"{self.date} {self.slot}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+        return slot_start(self.date, self.slot)
 
     @property
     def when(self) -> str:
@@ -184,7 +183,7 @@ async def sync_calendar(job: dict) -> tuple[str, dict]:
                 "status": result,
                 "calendarId": s.calendar_email,
                 "eventId": event_id,
-                "at": datetime.now().astimezone().isoformat(),
+                "at": datetime.now(UTC).isoformat(),
             }
         },
     )
@@ -281,7 +280,7 @@ async def notify_patient(job: dict) -> tuple[str, dict]:
                 "event": event,
                 "messageId": message_id,
                 "via": "template" if template else "text",
-                "at": datetime.now().astimezone().isoformat(),
+                "at": datetime.now(UTC).isoformat(),
             }
         },
     )

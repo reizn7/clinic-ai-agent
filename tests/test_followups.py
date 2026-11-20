@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 
 import httpx
 import pytest
 
+from clinic_agent.clinic_time import clinic_today
 from clinic_agent.config import settings
 from clinic_agent.integrations import google_calendar
 from clinic_agent.runtime import followups, outbox
@@ -16,7 +17,7 @@ PHONE = "919999999999"
 
 
 def _next_monday() -> str:
-    d = date.today() + timedelta(days=1)
+    d = clinic_today() + timedelta(days=1)
     while d.weekday() != 0:
         d += timedelta(days=1)
     return d.isoformat()
