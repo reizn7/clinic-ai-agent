@@ -50,6 +50,13 @@ VOICE_CHANNEL = "voice"
 # Text marker for a voice turn the agent opened (its greeting): no caller speech.
 CALL_STARTED = "[voice call started]"
 
+# The reply sent when a WhatsApp turn crashes (runtime.turn). Lives here so the
+# failure report can spot crashed turns without importing the agent.
+FALLBACK_REPLY = (
+    "Sorry — I hit a problem on my end and couldn't finish that. "
+    "Please try again in a moment."
+)
+
 # Human handoff (contract: console repo, docs/staff-handoff-contract.md).
 ESCALATIONS = "escalations"
 HANDLED_BY_STAFF = "staff"

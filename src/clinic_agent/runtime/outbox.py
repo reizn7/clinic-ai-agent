@@ -1,4 +1,5 @@
-"""Outbox: follow-up jobs (calendar sync, WhatsApp confirmations, staff replies).
+"""Outbox: follow-up jobs (calendar sync, WhatsApp confirmations, staff replies,
+failure reports).
 
 A booking tool writes the appointment and, in the same breath, queues jobs here.
 The worker (``run_forever``, started in the app lifespan) delivers them, so a slow
@@ -50,6 +51,15 @@ CALENDAR_SYNC = "calendar.sync"
 WHATSAPP_NOTIFY = "whatsapp.notify"
 # Inserted by the staff console: a staff member's WhatsApp reply (runtime.escalation).
 STAFF_REPLY = "staff.reply"
+# Inserted by the staff console (Analytics → "Send failures report"): analyse the
+# failed conversations in a date range and email the report (runtime.failure_report).
+FAILURE_REPORT = "failures.report"
+
+# Jobs that take minutes run on their own worker loop with a long lease, so they
+# never hold up patient confirmations and a lease can't expire mid-run (which
+# would let the job be claimed again and the email sent twice).
+LONG_RUNNING = frozenset({FAILURE_REPORT})
+LONG_LEASE = timedelta(minutes=30)
 
 _UNSENT = ["held", "pending"]
 # Langfuse trace names (stable, verb-first: dashboards filter on them).
@@ -57,6 +67,7 @@ _TRACE_NAMES = {
     CALENDAR_SYNC: "sync-doctor-calendar",
     WHATSAPP_NOTIFY: "send-appointment-confirmation",
     STAFF_REPLY: "send-staff-reply",
+    FAILURE_REPORT: "send-failure-report",
 }
 
 _hold: contextvars.ContextVar[str | None] = contextvars.ContextVar("outbox_hold", default=None)
@@ -185,11 +196,15 @@ def _subject(job: dict) -> str:
 # ---- worker -----------------------------------------------------------------------
 
 
-def _claim_sync() -> dict | None:
+def _claim_sync(long_running: bool = False) -> dict | None:
+    """Claim the next due job: a long-running one, or (default) any other kind."""
     now = datetime.now(UTC)
+    kinds = sorted(LONG_RUNNING)
+    lease = LONG_LEASE if long_running else LEASE
     return get_db()[COLLECTION].find_one_and_update(
         {
             "clinicId": settings.CLINIC_ID,
+            "kind": {"$in": kinds} if long_running else {"$nin": kinds},
             "$or": [
                 {"status": "pending", "nextAttemptAt": {"$lte": now.isoformat()}},
                 {"status": "processing", "leaseUntil": {"$lt": now.isoformat()}},  # crashed
@@ -198,7 +213,7 @@ def _claim_sync() -> dict | None:
         {
             "$set": {
                 "status": "processing",
-                "leaseUntil": (now + LEASE).isoformat(),
+                "leaseUntil": (now + lease).isoformat(),
                 "updatedAt": now.isoformat(),
             },
             "$inc": {"attempts": 1},
@@ -239,9 +254,9 @@ def _release_stale_holds_sync() -> int:
 Handler = Callable[[dict], Awaitable[tuple[str, dict]]]
 
 
-async def process_one(handlers: dict[str, Handler]) -> bool:
+async def process_one(handlers: dict[str, Handler], *, long_running: bool = False) -> bool:
     """Claim and run one due job. Returns False when nothing was due."""
-    job = await asyncio.to_thread(_claim_sync)
+    job = await asyncio.to_thread(_claim_sync, long_running)
     if job is None:
         return False
     handler = handlers.get(job["kind"])
@@ -270,22 +285,30 @@ async def process_one(handlers: dict[str, Handler]) -> bool:
     return True
 
 
-async def run_once(handlers: dict[str, Handler]) -> int:
-    await asyncio.to_thread(_release_stale_holds_sync)
+async def run_once(handlers: dict[str, Handler], *, long_running: bool = False) -> int:
+    if not long_running:
+        await asyncio.to_thread(_release_stale_holds_sync)
     done = 0
-    while done < _BATCH and await process_one(handlers):
+    while done < _BATCH and await process_one(handlers, long_running=long_running):
         done += 1
     return done
 
 
-async def run_forever() -> None:
-    """Loop until cancelled; one tick failing never kills the loop."""
+async def run_forever(*, long_running: bool = False) -> None:
+    """Loop until cancelled; one tick failing never kills the loop.
+
+    The app runs two: the regular worker, and one for ``LONG_RUNNING`` kinds.
+    """
     from clinic_agent.runtime import followups
 
-    log.info("outbox worker started (every %ss)", settings.OUTBOX_TICK_SECONDS)
+    log.info(
+        "outbox worker%s started (every %ss)",
+        " (long-running jobs)" if long_running else "",
+        settings.OUTBOX_TICK_SECONDS,
+    )
     while True:
         try:
-            await run_once(followups.HANDLERS)
+            await run_once(followups.HANDLERS, long_running=long_running)
         except asyncio.CancelledError:
             raise
         except Exception:

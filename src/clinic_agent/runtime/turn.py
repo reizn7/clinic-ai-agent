@@ -31,10 +31,7 @@ log = logging.getLogger("clinic_agent.runtime.turn")
 
 APP_NAME = "medi-desk-ai"
 
-FALLBACK_REPLY = (
-    "Sorry — I hit a problem on my end and couldn't finish that. "
-    "Please try again in a moment."
-)
+FALLBACK_REPLY = conversations.FALLBACK_REPLY
 
 # The agent tree is static, so build the runner once and reuse it.
 _runner = InMemoryRunner(agent=build_agent(), app_name=APP_NAME)

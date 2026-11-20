@@ -34,7 +34,9 @@ import logging
 import os
 import re
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 from clinic_agent.config import settings
 
@@ -354,6 +356,48 @@ def score_tool_errors(obs: Any, tool_calls: list[dict]) -> None:
         )
     except Exception:
         log.exception("could not score tool_error")
+
+
+# ---- reading traces back (failure report) -------------------------------------
+
+
+def session_observations(
+    session_id: str, *, since: datetime | None = None, max_items: int = 500
+) -> list[Any] | None:
+    """Every observation recorded in one Langfuse session, oldest first.
+
+    None when tracing is off. Uses the v2 observations endpoint, the real-time
+    read path (other public endpoints lag ~10 minutes). ``since`` (the
+    conversation's start) narrows the server's scan. Errors propagate.
+    """
+    if _client is None:
+        return None
+    seen: dict[str, Any] = {}
+    for page in _client.iter_observation_pages(
+        session_id=session_id,
+        from_start_time=since,
+        fields="core,basic,io,model,metrics",
+        limit=100,
+        max_items=max_items,
+    ):
+        for o in page.data:
+            seen.setdefault(o.id, o)  # rows aren't deduplicated server-side
+    return sorted(seen.values(), key=lambda o: o.start_time)
+
+
+def session_url(session_id: str) -> str | None:
+    """Link to a session in the Langfuse UI, or None (tracing off / lookup failed)."""
+    if _client is None or not session_id:
+        return None
+    try:
+        project_id = _client._get_project_id()  # cached by the SDK after one call
+    except Exception:
+        log.exception("could not look up the Langfuse project id")
+        return None
+    if not project_id:
+        return None
+    base = settings.LANGFUSE_BASE_URL.rstrip("/")
+    return f"{base}/project/{project_id}/sessions/{quote(session_id, safe='')}"
 
 
 def usage_details(usage_metadata: Any) -> dict[str, int] | None:

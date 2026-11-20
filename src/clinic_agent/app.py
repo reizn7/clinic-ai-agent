@@ -22,7 +22,7 @@ from clinic_agent.whatsapp.webhook import router as webhook_router  # noqa: E402
 @contextlib.asynccontextmanager
 def _ensure_indexes() -> None:
     """Clinic-scoped indexes (idempotent). Never blocks startup: log and carry on."""
-    from clinic_agent.runtime import conversations, debounce, escalation
+    from clinic_agent.runtime import conversations, debounce, escalation, failure_report
     from clinic_agent.tools import repo
 
     for ensure in (
@@ -30,6 +30,7 @@ def _ensure_indexes() -> None:
         conversations.ensure_indexes,
         debounce.ensure_indexes,
         escalation.ensure_indexes,
+        failure_report.ensure_indexes,
     ):
         try:
             ensure()
@@ -45,6 +46,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         asyncio.create_task(flusher.run_forever()),
         # Appointment follow-ups: doctor calendar sync + WhatsApp confirmations.
         asyncio.create_task(outbox.run_forever()),
+        # Slow console-requested jobs (the failures report) on their own loop.
+        asyncio.create_task(outbox.run_forever(long_running=True)),
     ]
     try:
         yield

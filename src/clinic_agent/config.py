@@ -100,6 +100,21 @@ class Settings(BaseSettings):
     # Redact phone numbers from trace payloads and hash them for user/session ids.
     LANGFUSE_MASK_PHONES: bool = True
 
+    # --- Failure report (Analytics page → "Send failures report") ---
+    FAILURE_REPORT_EMAIL: str = ""  # where the report goes; empty = the job fails
+    # Root-cause analysis benefits from a stronger model than the chat default.
+    FAILURE_REPORT_MODEL: str = "gemini-3.5-flash"
+    FAILURE_REPORT_MAX_CASES: int = 50  # failed conversations analysed per report
+    # The staff console's address, for "Open conversation" links in the email.
+    CONSOLE_BASE_URL: str = ""
+
+    # --- Email (SMTP; e.g. Gmail: smtp.gmail.com:587 + an app password) ---
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587  # 587 = STARTTLS, 465 = implicit TLS
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""  # defaults to SMTP_USERNAME
+
     # --- App ---
     LOG_LEVEL: str = "INFO"
     PORT: int = 3000
