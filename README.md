@@ -241,7 +241,7 @@ src/clinic_agent/
     repo.py              sync data access: clinic/doctors/patients/appointments + indexes
     slots.py             slot generation from working hours
   voice/
-    routes.py            GET /voice/call (page) + WS /voice/ws (token check), mounted if VOICE_ENABLED
+    routes.py            GET /voice/call (page) + WS /voice/ws (token check)
     bridge.py            run_call(): one call, page ⇄ ADK live session, persistence on hangup
     protocol.py          call-page protocol: parse start/media, build ready/media/clear/transcript/end
     audio.py             base64, MIME rate parsing, ~100 ms outbound chunker
@@ -272,8 +272,8 @@ v1/                      original Node.js/Express/Mongoose prototype (reference 
   `GET /healthz` (`{"status": "ok"}`), and mounts the webhook router at `/webhook`.
 - `lifespan` starts `sweeper.run_forever()` and `flusher.run_forever()` as asyncio
   tasks and cancels them on shutdown.
-- When `VOICE_ENABLED` is true, it also mounts the voice router: the call page
-  (`GET /voice/call`) and its WebSocket (`WS /voice/ws`).
+- It also mounts the voice router: the call page (`GET /voice/call`) and its
+  WebSocket (`WS /voice/ws`).
 - `main()` is the `medi-desk-ai` console script (`clinic-agent` still works as an alias). It runs uvicorn on `0.0.0.0:$PORT`.
 
 ### `phone.py`
@@ -667,7 +667,6 @@ Copy `.env.example` to `.env`. All settings live in
 | `DEBOUNCE_WINDOW_SECONDS` | `5.0` | Quiet gap before flushing |
 | `DEBOUNCE_MAX_WAIT_SECONDS` | `30.0` | Hard cap even while the user keeps typing |
 | `DEBOUNCE_TICK_SECONDS` | `1.0` | Flusher poll interval |
-| `VOICE_ENABLED` | `true` | Serve browser voice calls: the page at `/voice/call` and its WebSocket at `/voice/ws` |
 | `VOICE_MODEL` | `gemini-3.8-live` | Gemini Live native-audio model for voice calls (must support function calling) |
 | `VOICE_NAME` | `""` | Optional prebuilt voice (e.g. `Kore`, `Puck`); empty means the model default |
 | `VOICE_WS_TOKEN` | `""` | Optional shared secret; if set, open the page as `/voice/call?token=<value>` (the page passes it to the WebSocket) |
@@ -791,7 +790,7 @@ uv run ruff check .      # lint (line length 100; v1/ excluded)
 | `test_voice_protocol.py` | `start` parsing (incl. missing/invalid fields), every outbound builder |
 | `test_voice_conversations.py` | one conversation per call (`callId`), derived fields, analytics eligibility, WhatsApp isolation |
 | `test_voice_bridge.py` | full call against a fake live runner (`ready`, native-rate audio, barge-in `clear`, transcript frames only when requested, tool call, persistence), `end` on session end/error, invalid caller, start timeout |
-| `test_voice_routes.py` | token accept/reject on `/voice/ws`, `/voice/call` served only when `VOICE_ENABLED`, no other voice routes |
+| `test_voice_routes.py` | token accept/reject on `/voice/ws`, `/voice/call` served, no other voice routes |
 
 Tests patch `get_db` with `mongomock`. pytest runs with `asyncio_mode = "auto"` and
 `--import-mode=importlib`.

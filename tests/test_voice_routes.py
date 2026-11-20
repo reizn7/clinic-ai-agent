@@ -44,30 +44,22 @@ def test_ws_token_accept_and_reject(monkeypatch):
     assert len(calls) == 1
 
 
-def _client(monkeypatch, enabled: bool) -> TestClient:
-    monkeypatch.setattr(app_module.settings, "VOICE_ENABLED", enabled)
+def _client() -> TestClient:
     return TestClient(app_module.create_app())
 
 
-def test_call_page_served_when_enabled(monkeypatch):
-    res = _client(monkeypatch, True).get("/voice/call?token=abc")
+def test_call_page_served():
+    res = _client().get("/voice/call?token=abc")
     assert res.status_code == 200
     assert res.headers["content-type"].startswith("text/html")
     assert res.text == routes.CALL_PAGE
     assert "<title>" in res.text and "/voice/ws" in res.text
 
 
-def test_voice_routes_absent_when_disabled(monkeypatch):
-    client = _client(monkeypatch, False)
-    assert client.get("/voice/call").status_code == 404
-    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/voice/ws") as ws:
-        ws.receive_text()
-
-
-def test_only_browser_voice_routes_exist(monkeypatch):
+def test_only_browser_voice_routes_exist():
     # The old telephony-provider endpoint is gone: the voice router serves only
     # /voice/call and /voice/ws, and no other WebSocket under /voice/ is accepted.
     assert {r.path for r in routes.router.routes} == {"/voice/call", "/voice/ws"}
-    client = _client(monkeypatch, True)
+    client = _client()
     with pytest.raises(WebSocketDisconnect), client.websocket_connect("/voice/other") as ws:
         ws.receive_text()

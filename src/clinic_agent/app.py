@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 from dotenv import load_dotenv
 
@@ -16,10 +16,10 @@ from fastapi import FastAPI  # noqa: E402
 from clinic_agent.config import settings  # noqa: E402
 from clinic_agent.observability import init_tracing, shutdown_tracing  # noqa: E402
 from clinic_agent.runtime import flusher, outbox, sweeper  # noqa: E402
+from clinic_agent.voice.routes import router as voice_router  # noqa: E402
 from clinic_agent.whatsapp.webhook import router as webhook_router  # noqa: E402
 
 
-@contextlib.asynccontextmanager
 def _ensure_indexes() -> None:
     """Clinic-scoped indexes (idempotent). Never blocks startup: log and carry on."""
     from clinic_agent.runtime import conversations, debounce, escalation, failure_report
@@ -38,7 +38,8 @@ def _ensure_indexes() -> None:
             logging.getLogger("clinic_agent.app").exception("index setup failed: %s", ensure)
 
 
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     await asyncio.to_thread(_ensure_indexes)
     # Background loops: idle sweeper (finalize + analytics) and debounce flusher.
     tasks = [
@@ -81,10 +82,7 @@ def create_app() -> FastAPI:
 
     # Browser voice calls: the call page (GET /voice/call) and its WebSocket
     # (WS /voice/ws), bridged to Gemini Live.
-    if settings.VOICE_ENABLED:
-        from clinic_agent.voice.routes import router as voice_router
-
-        app.include_router(voice_router)
+    app.include_router(voice_router)
     return app
 
 

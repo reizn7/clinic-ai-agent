@@ -64,7 +64,6 @@ class Settings(BaseSettings):
     DEBOUNCE_TICK_SECONDS: float = 1.0  # how often the flusher polls
 
     # --- Voice channel (browser call page → Gemini Live) ---
-    VOICE_ENABLED: bool = True  # serve GET /voice/call (page) + WS /voice/ws (call audio)
     VOICE_MODEL: str = "gemini-3.8-live"  # Live API native-audio model (function calling)
     VOICE_NAME: str = ""  # optional prebuilt voice, e.g. "Kore"; empty = model default
     VOICE_WS_TOKEN: str = ""  # optional shared secret; if set, open /voice/call?token=<it>

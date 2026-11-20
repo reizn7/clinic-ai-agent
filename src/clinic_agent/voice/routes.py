@@ -1,4 +1,4 @@
-"""Browser voice-call routes. Mounted by ``app.create_app`` only when ``VOICE_ENABLED``.
+"""Browser voice-call routes, mounted by ``app.create_app``.
 
 * ``GET /voice/call`` serves the call page (``static/call.html``, read once at
   import). Open it as ``/voice/call?token=<VOICE_WS_TOKEN>``; the page passes its
